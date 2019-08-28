@@ -77,7 +77,10 @@ parseSchema rts = case JSON.parseEither JSON.parseJSON (rtsSchema rts) of
 
 buildTestSuites :: IO T.TestTree
 buildTestSuites = do
-  tests <- traverse buildTestSuite ["type.json"]
+  tests <- traverse buildTestSuite
+    [ "type.json"
+    , "properties.json"
+    ]
   pure $ T.testGroup "JSON schema official test suite" tests
 
 buildTestSuite :: String -> IO T.TestTree

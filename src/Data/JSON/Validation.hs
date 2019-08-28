@@ -5,7 +5,9 @@
 
 module Data.JSON.Validation where
 
-import Data.Functor (($>))
+import qualified Data.HashMap.Strict as Map
+import qualified Data.Typeable as Typeable
+import Data.Functor (($>), void)
 import qualified Data.Scientific as Scientific
 import qualified Data.Vector as V
 import qualified Data.Aeson as JSON
@@ -14,6 +16,7 @@ import qualified Data.Traversable as T
 import Data.Functor.Alt
 import Data.Text (Text)
 import qualified Data.Text as Tx
+import qualified Data.Set as Set
 
 import qualified Data.JSON.Schema as Sc
 
@@ -59,6 +62,8 @@ validate schema val = traverse (validate' val) (Sc.sValidations $ Sc.schema sche
 validate' :: JSON.Value -> Sc.Validation -> ValidationOutcome ()
 validate' value = \case
   Sc.ValType valType -> validateType value valType
+  Sc.ValProperties valProp -> validateProperties value valProp
+  Sc.ValBool b -> validateBoolean b
 
 
 validateType :: JSON.Value -> Sc.ValidationType -> ValidationOutcome ()
@@ -86,3 +91,33 @@ validateType value valType =
             then "type: " <> Sc.prettyPrimitiveType (V.head typs)
             else "one of the following type: " <> Tx.intercalate ", " (F.toList $ fmap Sc.prettyPrimitiveType typs)
        in ValidationErrors ["Expected " <> expected <> " but got " <> Sc.prettyPrimitiveType t]
+
+
+validateProperties :: JSON.Value -> Sc.ValidationProperties -> ValidationOutcome ()
+validateProperties value valProp = case value of
+  JSON.Object o -> F.traverse_ id
+    [ void $ Map.traverseWithKey (validateProps (Sc.vpProperties valProp)) o
+    , void $ validateAdditionalProps o valProp
+    ]
+  _ -> pure ()
+
+  where
+    validateProps props key jsonVal = case Map.lookup key props of
+      Nothing -> pure ()
+      Just schema -> void $ validate (Sc.SubSchema schema) jsonVal
+
+    validateAdditionalProps o valProp = case Sc.vpAdditionalProps valProp of
+      Sc.AllAdditionalProperties -> pure ()
+      Sc.NoAdditionalProperties ->
+        let keys = Set.fromList (Map.keys o)
+            allowedKeys = Set.fromList (Map.keys $ Sc.vpProperties valProp)
+            diff = Set.difference allowedKeys keys
+         in if Set.null diff
+              then pure ()
+              else Error $ ValidationErrors ["Unexpected keys: " <> Tx.pack (show diff)]
+      _ -> pure ()
+
+validateBoolean :: Bool -> ValidationOutcome ()
+validateBoolean b = if b
+  then pure ()
+  else Error $ ValidationErrors ["Boolean schema is false"]

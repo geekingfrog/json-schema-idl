@@ -1,22 +1,25 @@
-{-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE StrictData #-}
+{-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 
 module Data.JSON.Schema where
 
-import Control.Applicative
-import qualified Data.Foldable as F
-import qualified Data.Char as Chr
-import           Data.Aeson       ((.:), (.:?))
-import qualified Data.Aeson       as JSON
-import qualified Data.Aeson.Types as JSON
-import           Data.Text        (Text)
-import qualified Data.Text        as Tx
-import qualified Data.Vector      as V
-import GHC.Generics
-import qualified Data.HashMap.Strict as Map
+import           Control.Applicative
+import           Data.Aeson            ((.!=), (.:), (.:?))
+import qualified Data.Aeson            as JSON
+import qualified Data.Aeson.Types      as JSON
+import qualified Data.Char             as Chr
+import qualified Data.Foldable         as F
+import qualified Data.HashMap.Strict   as Map
+import qualified Data.Map.Strict       as OrdMap
+import qualified Data.Maybe            as Mb
+import           Data.Text             (Text)
+import           Data.Text.Encoding (encodeUtf8)
+import qualified Data.Text             as Tx
+import qualified Data.Vector           as V
+import           GHC.Generics
+import qualified Text.Regex.PCRE.Heavy as RE
 
 data JSONSchema
   = RootSchema RootMetadata Schema
@@ -61,35 +64,34 @@ data Schema = Schema
   deriving (Eq, Show, Generic)
 
 instance JSON.FromJSON Schema where
-  parseJSON raw = flip (JSON.withObject "schema") raw $ \o -> do
-    desc <- o .:? "description"
-    title <- o .:? "title"
-    validations <- parseValidations o
-    pure $ Schema desc title validations
+  parseJSON raw
+    = JSON.withObject "object schema" parseObject raw
+    <|> JSON.withBool "boolean schema" parseBool raw
 
--- instance JSON.ToJSON Schema where
---   toJSON s =
---     let m = validationToJSON (sValidation s)
---      in JSON.Object $ m
---           <> maybe mempty (Map.singleton "description" . JSON.String) (sDescription s)
---           <> maybe mempty (Map.singleton "title" . JSON.String) (sTitle s)
+    where
+      parseObject o = do
+        desc <- o .:? "description"
+        title <- o .:? "title"
+        validations <- parseValidationsObject o
+        pure $ Schema desc title validations
+
+      parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
 
 
-newtype Validation
+data Validation
   = ValType ValidationType
+  | ValProperties ValidationProperties
+  | ValBool Bool
   deriving (Eq, Show)
 
-parseValidations :: JSON.Object -> JSON.Parser (V.Vector Validation)
-parseValidations o = V.singleton . ValType <$> parseValidationType o
+parseValidationsObject :: JSON.Object -> JSON.Parser (V.Vector Validation)
+parseValidationsObject o = do
+  vals <- traverse optional
+    [ ValType <$> parseValidationType o
+    , ValProperties <$> parseValidationProperties o
+    ]
+  pure $ V.fromList $ Mb.catMaybes vals
 
--- data ValidationAny = ValidationAny
---   { vaType :: ValAnyType
---   , vaEnum :: V.Vector JSON.Value
---   }
---   deriving (Eq, Show)
-
--- validationToJSON :: Validation -> JSON.Object
--- validationToJSON v = error "wip validationToJSON"
 
 data ValidationType
   = OneType PrimitiveType
@@ -128,7 +130,7 @@ instance JSON.FromJSON PrimitiveType where
 
 parseValidationType :: JSON.Object -> JSON.Parser ValidationType
 parseValidationType o = o .:? "type" >>= \case
-  Nothing -> fail "No `type` property"
+  Nothing -> fail "No `type` key found"
   Just typVal -> parseOneType typVal <|> parseMultipleTypes typVal
 
     where
@@ -138,37 +140,55 @@ parseValidationType o = o .:? "type" >>= \case
       parseMultipleTypes :: JSON.Value -> JSON.Parser ValidationType
       parseMultipleTypes = fmap MultipleTypes . JSON.parseJSON
 
--- {
---   "$id": "https://example.com/address.schema.json",
---   "$schema": "http://json-schema.org/draft-07/schema#",
---   "description": "An address similar to http://microformats.org/wiki/h-card",
---   "type": "object",
---   "properties": {
---     "post-office-box": {
---       "type": "string"
---     },
---     "extended-address": {
---       "type": "string"
---     },
---     "street-address": {
---       "type": "string"
---     },
---     "locality": {
---       "type": "string"
---     },
---     "region": {
---       "type": "string"
---     },
---     "postal-code": {
---       "type": "string"
---     },
---     "country-name": {
---       "type": "string"
---     }
---   },
---   "required": [ "locality", "region", "country-name" ],
---   "dependencies": {
---     "post-office-box": [ "street-address" ],
---     "extended-address": [ "street-address" ]
---   }
--- }
+
+data ValidationProperties = ValidationProperties
+  { vpProperties      :: Map.HashMap Text Schema
+  , vpAdditionalProps :: AdditionalProperties
+  , vpPatternProps    :: OrdMap.Map RE.Regex Schema
+  }
+  deriving (Eq, Show)
+
+data AdditionalProperties
+  = NoAdditionalProperties
+  | SomeAdditionalProperties (V.Vector Schema)
+  | AllAdditionalProperties
+  deriving (Eq, Show)
+
+parseAdditionalProperties :: JSON.Object -> JSON.Parser AdditionalProperties
+parseAdditionalProperties o = o .:? "additionalProperties" >>= \case
+  Nothing -> pure AllAdditionalProperties
+  Just (JSON.Bool True) -> pure AllAdditionalProperties
+  Just (JSON.Bool False) -> pure NoAdditionalProperties
+  Just x -> SomeAdditionalProperties <$> JSON.parseJSON x
+
+parsePatternProperties :: JSON.Object -> JSON.Parser (OrdMap.Map RE.Regex Schema)
+parsePatternProperties o = o .:? "patternProperties" >>= \case
+  Nothing -> pure mempty
+  Just x -> flip (JSON.withObject "patternProperties object") x $ \o' ->
+    case traverse mkTuples (Map.toList o') of
+      Left err -> fail err
+      Right keyVals -> pure $ OrdMap.fromList keyVals
+
+  where
+    pcreOptions = []
+    mkTuples :: (Text, JSON.Value) -> Either String (RE.Regex, Schema)
+    mkTuples (k, v) = do
+      r <- RE.compileM (encodeUtf8 k) pcreOptions
+      s <- JSON.parseEither JSON.parseJSON v
+      pure (r, s)
+    -- case RE.compileM (encodeUtf8 k) pcreOptions of
+    --   Left err -> Left err
+    --   Right r -> Right (r, v)
+
+parseValidationProperties :: JSON.Object -> JSON.Parser ValidationProperties
+parseValidationProperties o = do
+  props <- o .:? "properties" .!= mempty
+  ap <- parseAdditionalProperties o
+  patterns <- parsePatternProperties o
+  if ap == AllAdditionalProperties && Map.null props && OrdMap.null patterns
+    then fail "no validation properties present"
+    else pure $ ValidationProperties
+           { vpProperties = props
+           , vpAdditionalProps = ap
+           , vpPatternProps = patterns
+           }

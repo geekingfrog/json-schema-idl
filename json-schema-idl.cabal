@@ -25,6 +25,8 @@ library
                      , bytestring
                      , unordered-containers
                      , semigroupoids
+                     , containers
+                     , pcre-heavy
 
   ghc-options:         -fwarn-incomplete-patterns -Werror
   exposed-modules:     Data.JSON.Schema
