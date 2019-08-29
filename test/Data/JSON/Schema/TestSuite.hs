@@ -80,6 +80,9 @@ buildTestSuites = do
   tests <- traverse buildTestSuite
     [ "type.json"
     , "properties.json"
+    -- , "maxItems.json"
+    -- , "minItems.json"
+    -- , "patternProperties.json" -- this requires `maximum` to fully pass
     ]
   pure $ T.testGroup "JSON schema official test suite" tests
 

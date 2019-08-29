@@ -45,3 +45,4 @@ test-suite test
                      , vector
 
   other-modules:       Data.JSON.Schema.TestSuite
+                     , Data.JSON.Schema.UnitTests

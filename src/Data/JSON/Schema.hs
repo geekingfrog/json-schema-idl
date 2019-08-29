@@ -59,7 +59,7 @@ instance JSON.FromJSON SchemaVersion where
 data Schema = Schema
   { sDescription :: Maybe Text
   , sTitle :: Maybe Text
-  , sValidations :: V.Vector Validation
+  , sValidators :: V.Vector Validator
   }
   deriving (Eq, Show, Generic)
 
@@ -72,28 +72,30 @@ instance JSON.FromJSON Schema where
       parseObject o = do
         desc <- o .:? "description"
         title <- o .:? "title"
-        validations <- parseValidationsObject o
+        validations <- parseValidatorsObject o
         pure $ Schema desc title validations
 
       parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
 
 
-data Validation
-  = ValType ValidationType
-  | ValProperties ValidationProperties
+data Validator
+  = ValType TypeValidator
+  | ValObject ObjectValidator
   | ValBool Bool
+  | ValArray ArrayValidator
   deriving (Eq, Show)
 
-parseValidationsObject :: JSON.Object -> JSON.Parser (V.Vector Validation)
-parseValidationsObject o = do
+parseValidatorsObject :: JSON.Object -> JSON.Parser (V.Vector Validator)
+parseValidatorsObject o = do
   vals <- traverse optional
-    [ ValType <$> parseValidationType o
-    , ValProperties <$> parseValidationProperties o
+    [ ValType <$> parseTypeValidator o
+    , ValObject <$> parseValidatorProperties o
+    , ValArray <$> parseArrayValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
 
-data ValidationType
+data TypeValidator
   = OneType PrimitiveType
   | MultipleTypes (V.Vector PrimitiveType)
   deriving (Show, Eq)
@@ -128,23 +130,23 @@ instance JSON.FromJSON PrimitiveType where
     { JSON.constructorTagModifier = (\(x:xs) -> Chr.toLower x : xs) . drop 2
     }
 
-parseValidationType :: JSON.Object -> JSON.Parser ValidationType
-parseValidationType o = o .:? "type" >>= \case
+parseTypeValidator :: JSON.Object -> JSON.Parser TypeValidator
+parseTypeValidator o = o .:? "type" >>= \case
   Nothing -> fail "No `type` key found"
   Just typVal -> parseOneType typVal <|> parseMultipleTypes typVal
 
     where
-      parseOneType :: JSON.Value -> JSON.Parser ValidationType
+      parseOneType :: JSON.Value -> JSON.Parser TypeValidator
       parseOneType = fmap OneType . JSON.parseJSON
 
-      parseMultipleTypes :: JSON.Value -> JSON.Parser ValidationType
+      parseMultipleTypes :: JSON.Value -> JSON.Parser TypeValidator
       parseMultipleTypes = fmap MultipleTypes . JSON.parseJSON
 
 
-data ValidationProperties = ValidationProperties
-  { vpProperties      :: Map.HashMap Text Schema
-  , vpAdditionalProps :: AdditionalProperties
-  , vpPatternProps    :: OrdMap.Map RE.Regex Schema
+data ObjectValidator = ObjectValidator
+  { ovProperties      :: Map.HashMap Text Schema
+  , ovAdditionalProps :: AdditionalProperties
+  , ovPatternProps    :: OrdMap.Map RE.Regex Schema
   }
   deriving (Eq, Show)
 
@@ -180,15 +182,29 @@ parsePatternProperties o = o .:? "patternProperties" >>= \case
     --   Left err -> Left err
     --   Right r -> Right (r, v)
 
-parseValidationProperties :: JSON.Object -> JSON.Parser ValidationProperties
-parseValidationProperties o = do
+parseValidatorProperties :: JSON.Object -> JSON.Parser ObjectValidator
+parseValidatorProperties o = do
   props <- o .:? "properties" .!= mempty
   ap <- parseAdditionalProperties o
   patterns <- parsePatternProperties o
   if ap == AllAdditionalProperties && Map.null props && OrdMap.null patterns
     then fail "no validation properties present"
-    else pure $ ValidationProperties
-           { vpProperties = props
-           , vpAdditionalProps = ap
-           , vpPatternProps = patterns
+    else pure $ ObjectValidator
+           { ovProperties = props
+           , ovAdditionalProps = ap
+           , ovPatternProps = patterns
            }
+
+data ArrayValidator = ArrayValidator
+  { avMaxItems :: Maybe Int
+  , avMinItems :: Maybe Int
+  }
+  deriving (Eq, Show)
+
+parseArrayValidator :: JSON.Object -> JSON.Parser ArrayValidator
+parseArrayValidator o = do
+  maxI <- o .:? "maxItems"
+  minI <- o .:? "minItems"
+  case (maxI, minI) of
+    (Nothing, Nothing) -> fail "no array properties to validate"
+    _ -> pure $ ArrayValidator maxI minI
