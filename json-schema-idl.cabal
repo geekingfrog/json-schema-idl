@@ -43,6 +43,9 @@ test-suite test
                      , aeson
                      , text
                      , vector
+                     , containers
+                     , unordered-containers
+                     , pcre-heavy
 
   other-modules:       Data.JSON.Schema.TestSuite
                      , Data.JSON.Schema.UnitTests

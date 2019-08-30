@@ -1,3 +1,5 @@
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE DeriveFunctor     #-}
 {-# LANGUAGE DerivingVia       #-}
@@ -6,6 +8,7 @@
 
 module Data.JSON.Validation where
 
+import qualified Data.Maybe as Mb
 import           Text.Regex.PCRE.Heavy ((=~))
 import qualified Data.Aeson          as JSON
 import qualified Data.Foldable       as F
@@ -111,22 +114,33 @@ validateObject value valObj = case value of
       Nothing -> pure ()
       Just schema -> void $ validate (Sc.SubSchema schema) jsonVal
 
-    validateAdditionalProps o valObj = case Sc.ovAdditionalProps valObj of
-      Sc.AllAdditionalProperties -> pure ()
-      Sc.NoAdditionalProperties ->
-        let keys = Set.fromList (Map.keys o)
-            allowedKeys = Set.fromList (Map.keys $ Sc.ovProperties valObj)
-            diff = Set.difference allowedKeys keys
-         in if Set.null diff
-              then pure ()
-              else Error $ ValidatorErrors ["Unexpected keys: " <> Tx.pack (show diff)]
-      _ -> pure ()
+    validateAdditionalProps o valObj =
+      let additionalKeyVals = getAdditionalKeyValues o valObj
+      in
+      case Sc.ovAdditionalProps valObj of
+        Sc.AllAdditionalProperties -> pure ()
+        Sc.NoAdditionalProperties -> if null additionalKeyVals
+          then pure ()
+          else Error $ ValidatorErrors ["Unexpected keys: " <> Tx.pack (show $ map fst additionalKeyVals)]
+        Sc.SomeAdditionalProperties schema ->
+          F.traverse_ (validate (Sc.SubSchema schema) . snd) additionalKeyVals
 
     validatePatternProps o patternProps = F.traverse_ (validateOnePatternProp o) (OrdMap.toList patternProps)
 
     validateOnePatternProp o (regexp, schema) = void $ Map.traverseWithKey
       (\k v -> if k =~ regexp then void (validate (Sc.SubSchema schema) v) else pure ())
       o
+
+    -- additionalProperties and patternProperties interaction requires some logic to get all
+    -- keys covered neither by `properties` nor by `patternProperties`
+    getAdditionalKeyValues :: JSON.Object -> Sc.ObjectValidator -> [(Text, JSON.Value)]
+    getAdditionalKeyValues obj valObj =
+      let existingKeys = Set.fromList $ Map.keys obj
+          allowedKeys = Set.fromList (Map.keys $ Sc.ovProperties valObj)
+          allAdditionalKeys = Set.difference existingKeys allowedKeys
+          allPatterns = OrdMap.keys (Sc.ovPatternProps valObj)
+          additionalKeys = filter (\k -> not $ F.any (k =~) allPatterns) (Set.toList allAdditionalKeys)
+      in Mb.mapMaybe (\k -> (k,) <$> Map.lookup k obj) additionalKeys
 
 validateBoolean :: Bool -> ValidationOutcome ()
 validateBoolean b = if b

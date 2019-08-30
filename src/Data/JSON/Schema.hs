@@ -41,6 +41,11 @@ schema = \case
   (RootSchema _ s) -> s
   (SubSchema s) -> s
 
+validators :: JSONSchema -> V.Vector Validator
+validators = \case
+  (RootSchema _ s) -> sValidators s
+  (SubSchema s) -> sValidators s
+
 data RootMetadata = RootMetadata
   { rmVersion :: SchemaVersion
   , rmId :: Maybe Text
@@ -61,7 +66,7 @@ data Schema = Schema
   , sTitle :: Maybe Text
   , sValidators :: V.Vector Validator
   }
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show, Ord, Generic)
 
 instance JSON.FromJSON Schema where
   parseJSON raw
@@ -83,7 +88,7 @@ data Validator
   | ValObject ObjectValidator
   | ValBool Bool
   | ValArray ArrayValidator
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
 
 parseValidatorsObject :: JSON.Object -> JSON.Parser (V.Vector Validator)
 parseValidatorsObject o = do
@@ -98,7 +103,7 @@ parseValidatorsObject o = do
 data TypeValidator
   = OneType PrimitiveType
   | MultipleTypes (V.Vector PrimitiveType)
-  deriving (Show, Eq)
+  deriving (Eq, Show, Ord)
 
 data PrimitiveType
   = PTNull
@@ -108,7 +113,7 @@ data PrimitiveType
   | PTNumber
   | PTInteger
   | PTString
-  deriving (Show, Eq, Generic)
+  deriving (Eq, Show, Ord, Generic)
 
 prettyPrimitiveType :: PrimitiveType -> Text
 prettyPrimitiveType = \case
@@ -148,13 +153,26 @@ data ObjectValidator = ObjectValidator
   , ovAdditionalProps :: AdditionalProperties
   , ovPatternProps    :: OrdMap.Map RE.Regex Schema
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
 
 data AdditionalProperties
   = NoAdditionalProperties
-  | SomeAdditionalProperties (V.Vector Schema)
+  | SomeAdditionalProperties Schema
   | AllAdditionalProperties
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
+
+parseValidatorProperties :: JSON.Object -> JSON.Parser ObjectValidator
+parseValidatorProperties o = do
+  props <- o .:? "properties" .!= mempty
+  ap <- parseAdditionalProperties o
+  patterns <- parsePatternProperties o
+  if ap == AllAdditionalProperties && Map.null props && OrdMap.null patterns
+    then fail "no validation properties present"
+    else pure $ ObjectValidator
+           { ovProperties = props
+           , ovAdditionalProps = ap
+           , ovPatternProps = patterns
+           }
 
 parseAdditionalProperties :: JSON.Object -> JSON.Parser AdditionalProperties
 parseAdditionalProperties o = o .:? "additionalProperties" >>= \case
@@ -178,28 +196,13 @@ parsePatternProperties o = o .:? "patternProperties" >>= \case
       r <- RE.compileM (encodeUtf8 k) pcreOptions
       s <- JSON.parseEither JSON.parseJSON v
       pure (r, s)
-    -- case RE.compileM (encodeUtf8 k) pcreOptions of
-    --   Left err -> Left err
-    --   Right r -> Right (r, v)
 
-parseValidatorProperties :: JSON.Object -> JSON.Parser ObjectValidator
-parseValidatorProperties o = do
-  props <- o .:? "properties" .!= mempty
-  ap <- parseAdditionalProperties o
-  patterns <- parsePatternProperties o
-  if ap == AllAdditionalProperties && Map.null props && OrdMap.null patterns
-    then fail "no validation properties present"
-    else pure $ ObjectValidator
-           { ovProperties = props
-           , ovAdditionalProps = ap
-           , ovPatternProps = patterns
-           }
 
 data ArrayValidator = ArrayValidator
-  { avMaxItems :: Maybe Int
-  , avMinItems :: Maybe Int
+  { avMinItems :: Maybe Int
+  , avMaxItems :: Maybe Int
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
 
 parseArrayValidator :: JSON.Object -> JSON.Parser ArrayValidator
 parseArrayValidator o = do
@@ -207,4 +210,4 @@ parseArrayValidator o = do
   minI <- o .:? "minItems"
   case (maxI, minI) of
     (Nothing, Nothing) -> fail "no array properties to validate"
-    _ -> pure $ ArrayValidator maxI minI
+    _ -> pure $ ArrayValidator minI maxI
