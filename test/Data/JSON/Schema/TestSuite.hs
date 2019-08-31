@@ -78,12 +78,43 @@ parseSchema rts = case JSON.parseEither JSON.parseJSON (rtsSchema rts) of
 buildTestSuites :: IO T.TestTree
 buildTestSuites = do
   tests <- traverse buildTestSuite
-    [ "type.json"
+    [ "additionalItems.json"
+    , "additionalProperties.json"
+    -- , "allOf.json"
+    -- , "anyOf.json"
+    , "boolean_schema.json"
+    -- , "const.json"
+    -- , "contains.json"
+    -- , "default.json"
+    -- , "definitions.json"
+    -- , "dependencies.json"
+    -- , "enum.json"
+    , "exclusiveMaximum.json"
+    , "exclusiveMinimum.json"
+    -- , "if-then-else.json"
+    -- , "items.json" -- requires definitions, references to def and additionalItems to fully pass
+    , "maximum.json"
+    , "maxItems.json"
+    -- , "maxLength.json"
+    -- , "maxProperties.json"
+    , "minimum.json"
+    , "minItems.json"
+    -- , "minLength.json"
+    -- , "minProperties.json"
+    , "multipleOf.json"
+    -- , "not.json"
+    -- , "oneOf.json"
+    -- , "pattern.json"
+    , "patternProperties.json"
     , "properties.json"
-    -- , "maxItems.json"
-    -- , "minItems.json"
-    -- , "patternProperties.json" -- this requires `maximum` to fully pass
+    -- , "propertyNames.json"
+    -- , "ref.json"
+    -- , "refRemote.json"
+    -- , "required.json"
+    , "type.json"
+    -- , "uniqueItems.json"
     ]
+
   pure $ T.testGroup "JSON schema official test suite" tests
 
 buildTestSuite :: String -> IO T.TestTree

@@ -13,14 +13,15 @@ import qualified Test.Tasty           as T
 import           Test.Tasty.HUnit     ((@=?))
 import qualified Test.Tasty.HUnit     as T.H
 import qualified Data.Set as Set
+import GHC.Stack (HasCallStack)
 
 import qualified Data.JSON.Schema     as Sc
 import qualified Data.JSON.Validation as Val
 
 tests :: T.TestTree
 tests = T.testGroup "unit tests"
-  [ randomTest
-  , parsingTests
+  [ parsingTests
+  -- , randomTest
   ]
 
 
@@ -64,7 +65,12 @@ parsingTests = T.testGroup "parsing"
       |]
 
       let typeValidator = Sc.ValType $ Sc.OneType Sc.PTInteger
-      let arrValidator = Sc.ArrayValidator (Just 2) (Just 5)
+      let arrValidator = Sc.ArrayValidator
+            { Sc.avMinItems        = Just 2
+            , Sc.avMaxItems        = Just 5
+            , Sc.avItems           = Sc.NoItemsValidator
+            , Sc.avAdditionalItems = Sc.AdditionalAllAllowed
+            }
       let fooSchema = Sc.Schema Nothing Nothing $ V.singleton typeValidator
       let barSchema = Sc.Schema Nothing Nothing $ V.fromList
             [ Sc.ValType (Sc.OneType Sc.PTArray)
@@ -81,6 +87,7 @@ parsingTests = T.testGroup "parsing"
             , Sc.ovPatternProps    = mempty
             }
 
+      -- print ("kitchen sink, parsed schema: " <> show parseSchema raw)
       expectValidators [expected] (parseSchema raw)
 
   ]
@@ -100,7 +107,7 @@ randomTest = T.H.testCaseSteps "boom" $ \step -> do
       }
     |]
   let result = Val.validate schema val
-  step ("parsed schema: " <> show schema)
+  -- step ("parsed schema: " <> show schema)
   -- T.H.assertEqual "nope" (Val.Ok val) result
   pure ()
 
@@ -108,7 +115,7 @@ parseSchema :: JSON.Value -> Either String Sc.JSONSchema
 parseSchema = JSON.parseEither JSON.parseJSON
 
 -- in any order
-expectValidators :: [Sc.Validator] -> Either String Sc.JSONSchema -> T.H.Assertion
+expectValidators :: (HasCallStack) => [Sc.Validator] -> Either String Sc.JSONSchema -> T.H.Assertion
 expectValidators expectedValidators = \case
   Left err -> T.H.assertFailure $ "Expected a json schema but got a parse error: " <> show err
   Right schema -> Set.fromList expectedValidators @=? Set.fromList (V.toList $ Sc.validators schema)

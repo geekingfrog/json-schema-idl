@@ -1,3 +1,4 @@
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -20,6 +21,7 @@ import qualified Data.Text             as Tx
 import qualified Data.Vector           as V
 import           GHC.Generics
 import qualified Text.Regex.PCRE.Heavy as RE
+import Data.Scientific
 
 data JSONSchema
   = RootSchema RootMetadata Schema
@@ -27,13 +29,18 @@ data JSONSchema
   deriving (Eq, Show)
 
 instance JSON.FromJSON JSONSchema where
-  parseJSON raw = flip (JSON.withObject "json schema") raw $ \o -> do
-    mbVersion <- o .:? "$schema" -- TODO check this is a valid URI
-    i <- o .:? "$id"
-    case mbVersion of
-      Just ver -> RootSchema (RootMetadata ver i) <$> JSON.parseJSON raw
-      Nothing -> SubSchema <$> JSON.parseJSON raw
-    -- error "wip fromJSON JSONSchema"
+  parseJSON raw
+    = JSON.withObject "object JSONschema" parseObject raw
+    <|> JSON.withBool "boolean JSONschema" parseBool raw
+
+    where
+      parseObject o = do
+        mbVersion <- o .:? "$schema" -- TODO check this is a valid URI
+        i <- o .:? "$id"
+        case mbVersion of
+          Just ver -> RootSchema (RootMetadata ver i) <$> JSON.parseJSON raw
+          Nothing -> SubSchema <$> JSON.parseJSON raw
+      parseBool b = pure $ SubSchema $ Schema Nothing Nothing (V.singleton (ValBool b))
 
 
 schema :: JSONSchema -> Schema
@@ -70,32 +77,33 @@ data Schema = Schema
 
 instance JSON.FromJSON Schema where
   parseJSON raw
-    = JSON.withObject "object schema" parseObject raw
-    <|> JSON.withBool "boolean schema" parseBool raw
+    = JSON.withObject "object subschema" parseObject raw
+    <|> JSON.withBool "boolean subschema" parseBool raw
 
     where
       parseObject o = do
         desc <- o .:? "description"
         title <- o .:? "title"
-        validations <- parseValidatorsObject o
+        validations <- parseAllValidators o
         pure $ Schema desc title validations
 
       parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
-
 
 data Validator
   = ValType TypeValidator
   | ValObject ObjectValidator
   | ValBool Bool
   | ValArray ArrayValidator
+  | ValNumeric NumericValidator
   deriving (Eq, Show, Ord)
 
-parseValidatorsObject :: JSON.Object -> JSON.Parser (V.Vector Validator)
-parseValidatorsObject o = do
+parseAllValidators :: JSON.Object -> JSON.Parser (V.Vector Validator)
+parseAllValidators o = do
   vals <- traverse optional
     [ ValType <$> parseTypeValidator o
-    , ValObject <$> parseValidatorProperties o
+    , ValObject <$> parseObjectValidator o
     , ValArray <$> parseArrayValidator o
+    , ValNumeric <$> parseNumericValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
@@ -161,8 +169,8 @@ data AdditionalProperties
   | AllAdditionalProperties
   deriving (Eq, Show, Ord)
 
-parseValidatorProperties :: JSON.Object -> JSON.Parser ObjectValidator
-parseValidatorProperties o = do
+parseObjectValidator :: JSON.Object -> JSON.Parser ObjectValidator
+parseObjectValidator o = do
   props <- o .:? "properties" .!= mempty
   ap <- parseAdditionalProperties o
   patterns <- parsePatternProperties o
@@ -199,15 +207,73 @@ parsePatternProperties o = o .:? "patternProperties" >>= \case
 
 
 data ArrayValidator = ArrayValidator
-  { avMinItems :: Maybe Int
-  , avMaxItems :: Maybe Int
+  { avMinItems        :: Maybe Int
+  , avMaxItems        :: Maybe Int
+  , avItems           :: ItemsValidator
+  , avAdditionalItems :: AdditionalItemsValidator
   }
+  deriving (Eq, Show, Ord)
+
+data ItemsValidator
+  = SingleSchema Schema
+  | MultipleSchemas (V.Vector Schema)
+  | NoItemsValidator
+  deriving (Eq, Show, Ord)
+
+data AdditionalItemsValidator
+  = AdditionalSingleSchema Schema
+  | AdditionalMultipleSchemas (V.Vector Schema)
+  | AdditionalAllAllowed
+  | AdditionalAllForbidden
   deriving (Eq, Show, Ord)
 
 parseArrayValidator :: JSON.Object -> JSON.Parser ArrayValidator
 parseArrayValidator o = do
-  maxI <- o .:? "maxItems"
-  minI <- o .:? "minItems"
-  case (maxI, minI) of
-    (Nothing, Nothing) -> fail "no array properties to validate"
-    _ -> pure $ ArrayValidator minI maxI
+  avMinItems <- o .:? "minItems"
+  avMaxItems <- o .:? "maxItems"
+  avItems <- parseItemsValidator (Map.lookup "items" o)
+  avAdditionalItems <- parseAdditionalItemsValidator (Map.lookup "additionalItems" o)
+
+  case (avMinItems, avMaxItems, avItems, avAdditionalItems) of
+    (Nothing, Nothing, NoItemsValidator, AdditionalAllAllowed) -> fail "no array properties to validate"
+    _ -> pure $ ArrayValidator{..}
+
+  where
+    parseItemsValidator = \case
+      Nothing -> pure NoItemsValidator
+      Just jsonValue ->
+        (SingleSchema <$> JSON.parseJSON jsonValue)
+        <|> (MultipleSchemas <$> JSON.parseJSON jsonValue)
+
+    parseAdditionalItemsValidator = \case
+      Nothing -> pure AdditionalAllAllowed
+      Just jsonValue ->
+        (AdditionalSingleSchema <$> JSON.parseJSON jsonValue)
+        <|> (AdditionalMultipleSchemas <$> JSON.parseJSON jsonValue)
+        <|> parseBool jsonValue
+
+    parseBool = \case
+      JSON.Bool b -> if b
+        then pure AdditionalAllAllowed
+        else pure AdditionalAllForbidden
+      _ -> fail "not a boolean for additionalItems keyword"
+
+data NumericValidator = NumericValidator
+  { nvMultipleOf       :: Maybe Scientific
+  , nvMinimum          :: Maybe Scientific
+  , nvMaximum          :: Maybe Scientific
+  , nvExclusiveMinimum :: Maybe Scientific
+  , nvExclusiveMaximum :: Maybe Scientific
+  }
+  deriving (Eq, Show, Ord)
+
+parseNumericValidator :: JSON.Object -> JSON.Parser NumericValidator
+parseNumericValidator o = do
+  nvMultipleOf       <- o .:? "multipleOf"
+  nvMinimum          <- o .:? "minimum"
+  nvMaximum          <- o .:? "maximum"
+  nvExclusiveMinimum <- o .:? "exclusiveMinimum"
+  nvExclusiveMaximum <- o .:? "exclusiveMaximum"
+  case nvMultipleOf <|> nvMinimum <|> nvMaximum <|> nvExclusiveMinimum <|> nvExclusiveMaximum of
+    Nothing -> fail "no numeric validator"
+    Just _ -> pure NumericValidator{..}

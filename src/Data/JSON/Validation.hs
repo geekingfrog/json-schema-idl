@@ -29,7 +29,7 @@ import qualified Data.JSON.Schema    as Sc
 -- Data.Validation on hackage requires lens oÔ so let's roll our own simple version
 data ValidationOutcome a
   = Ok a
-  | Error ValidatorErrors
+  | Error ValidationErrors
   deriving (Eq, Show, Functor)
 
 instance Applicative ValidationOutcome where
@@ -57,7 +57,7 @@ instance T.Traversable ValidationOutcome where
     (Error err) -> pure (Error err)
   {-# INLINE traverse #-}
 
-newtype ValidatorErrors = ValidatorErrors { getValidatorErrors :: [Text] }
+newtype ValidationErrors = ValidationErrors { getValidatorErrors :: [Text] }
   deriving (Eq, Show)
   deriving (Semigroup, Monoid) via [Text]
 
@@ -71,6 +71,7 @@ validate' value = \case
   Sc.ValObject valObj -> validateObject value valObj
   Sc.ValBool b -> validateBoolean b
   Sc.ValArray valA -> validateArray value valA
+  Sc.ValNumeric valN -> validateNumeric value valN
 
 
 validateType :: JSON.Value -> Sc.TypeValidator -> ValidationOutcome ()
@@ -92,12 +93,12 @@ validateType value valType =
         else want Sc.PTNumber
 
   where
-    mkError :: V.Vector Sc.PrimitiveType -> Sc.PrimitiveType -> ValidatorErrors
+    mkError :: V.Vector Sc.PrimitiveType -> Sc.PrimitiveType -> ValidationErrors
     mkError typs t =
       let expected = if V.length typs == 1
             then "type: " <> Sc.prettyPrimitiveType (V.head typs)
             else "one of the following type: " <> Tx.intercalate ", " (F.toList $ fmap Sc.prettyPrimitiveType typs)
-       in ValidatorErrors ["Expected " <> expected <> " but got " <> Sc.prettyPrimitiveType t]
+       in ValidationErrors ["Expected " <> expected <> " but got " <> Sc.prettyPrimitiveType t]
 
 
 validateObject :: JSON.Value -> Sc.ObjectValidator -> ValidationOutcome ()
@@ -121,7 +122,7 @@ validateObject value valObj = case value of
         Sc.AllAdditionalProperties -> pure ()
         Sc.NoAdditionalProperties -> if null additionalKeyVals
           then pure ()
-          else Error $ ValidatorErrors ["Unexpected keys: " <> Tx.pack (show $ map fst additionalKeyVals)]
+          else Error $ ValidationErrors ["Unexpected keys: " <> Tx.pack (show $ map fst additionalKeyVals)]
         Sc.SomeAdditionalProperties schema ->
           F.traverse_ (validate (Sc.SubSchema schema) . snd) additionalKeyVals
 
@@ -145,13 +146,14 @@ validateObject value valObj = case value of
 validateBoolean :: Bool -> ValidationOutcome ()
 validateBoolean b = if b
   then pure ()
-  else Error $ ValidatorErrors ["Boolean schema is false"]
+  else Error $ ValidationErrors ["Boolean schema is false"]
 
 validateArray :: JSON.Value -> Sc.ArrayValidator -> ValidationOutcome ()
 validateArray value valA = case value of
   JSON.Array arr -> F.traverse_ id
-    [ void $ validateMaxItems arr valA
-    , void $ validateMinItems arr valA
+    [ validateMaxItems arr valA
+    , validateMinItems arr valA
+    , validateItems arr valA
     ]
   _ -> pure ()
 
@@ -160,12 +162,88 @@ validateArray value valA = case value of
       Nothing -> Ok ()
       Just x -> if V.length a <= x
         then Ok ()
-        else Error $ ValidatorErrors
+        else Error $ ValidationErrors
           [Tx.pack $ "MaxItems is " <> show x <> " but array has " <> show (V.length a)]
 
     validateMinItems a v = case Sc.avMinItems v of
       Nothing -> Ok ()
       Just x -> if V.length a >= x
         then Ok ()
-        else Error $ ValidatorErrors
+        else Error $ ValidationErrors
           [Tx.pack $ "MinItems is " <> show x <> " but array has " <> show (V.length a)]
+
+    validateItems a v = case Sc.avItems v of
+      Sc.SingleSchema schema -> F.traverse_ (validate (Sc.SubSchema schema)) a
+
+      Sc.MultipleSchemas schemas -> if V.length a <= V.length schemas
+        then
+          F.traverse_ (\(schema, val) -> validate (Sc.SubSchema schema) val) (V.zip schemas a)
+        else
+          let remainingItems = V.drop (V.length schemas) a
+           in case Sc.avAdditionalItems v of
+                Sc.AdditionalAllAllowed
+                  -> pure ()
+
+                Sc.AdditionalAllForbidden
+                  -> Error $ ValidationErrors ["Too many items"]
+
+                Sc.AdditionalSingleSchema schema
+                  -> F.traverse_ (validate (Sc.SubSchema schema)) remainingItems
+
+                Sc.AdditionalMultipleSchemas schemas'
+                  -> if V.length remainingItems <= V.length schemas'
+                    then
+                      F.traverse_ (\(s, val) -> validate (Sc.SubSchema s) val) (V.zip schemas' remainingItems)
+                    else
+                      Error $ ValidationErrors ["Too many items"]
+
+      Sc.NoItemsValidator -> pure ()
+
+
+validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValidationOutcome ()
+validateNumeric value valN = case value of
+  JSON.Number n -> F.traverse_ id
+    [ validateMultipleOf n (Sc.nvMultipleOf valN)
+    , validateMinimum n (Sc.nvMinimum valN)
+    , validateMaximum n (Sc.nvMaximum valN)
+    , validateExclusiveMinimum n (Sc.nvExclusiveMinimum valN)
+    , validateExclusiveMaximum n (Sc.nvExclusiveMaximum valN)
+    ]
+  _ -> pure ()
+
+  where
+    validateMultipleOf n = \case
+      Nothing -> pure ()
+      Just x ->
+        let (coeffN, baseN) = (Scientific.coefficient n, Scientific.base10Exponent n)
+            (coeffX, baseX) = (Scientific.coefficient x, Scientific.base10Exponent x)
+         in if baseN == baseX
+              then assert "multipleOf" (coeffN `mod` coeffX == 0)
+              else
+                let diff = abs (baseN - baseX)
+                    (cn', cx') = if baseN > baseX
+                      then (coeffN * 10 ^ diff, coeffX)
+                      else (coeffN, coeffX * 10 ^ diff)
+                 in assert "multipleOf" (cn' `mod` cx' == 0)
+
+    validateMinimum n = maybe (pure ()) (\x -> assert "minimum" (n >= x))
+    validateMaximum n = maybe (pure ()) (\x -> assert "maximum" (n <= x))
+    validateExclusiveMinimum n = maybe (pure ()) (\x -> assert "exclusiveMinimum" (x < n))
+    validateExclusiveMaximum n = maybe (pure ()) (\x -> assert "exclusiveMaximum" (x > n))
+
+    assert :: Text -> Bool -> ValidationOutcome ()
+    assert keyword = \case
+      True -> Ok ()
+      False -> Error $ ValidationErrors [keyword <> " failed"]
+
+    -- whenJust f = \case
+    --   Nothing -> pure ()
+    --   Just x -> f 
+
+
+  -- { nvMultipleOf       :: Maybe Scientific
+  -- , nvMinimum          :: Maybe Scientific
+  -- , nvMaximum          :: Maybe Scientific
+  -- , nvExclusiveMinimum :: Maybe Scientific
+  -- , nvExclusiveMaximum :: Maybe Scientific
+  -- }
