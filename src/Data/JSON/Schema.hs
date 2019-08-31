@@ -211,6 +211,7 @@ data ArrayValidator = ArrayValidator
   , avMaxItems        :: Maybe Int
   , avItems           :: ItemsValidator
   , avAdditionalItems :: AdditionalItemsValidator
+  , avUniqueItems     :: UniqueItems
   }
   deriving (Eq, Show, Ord)
 
@@ -220,6 +221,11 @@ data ItemsValidator
   | NoItemsValidator
   deriving (Eq, Show, Ord)
 
+instance JSON.FromJSON ItemsValidator where
+  parseJSON raw
+    = (SingleSchema <$> JSON.parseJSON raw)
+    <|> (MultipleSchemas <$> JSON.parseJSON raw)
+
 data AdditionalItemsValidator
   = AdditionalSingleSchema Schema
   | AdditionalMultipleSchemas (V.Vector Schema)
@@ -227,36 +233,37 @@ data AdditionalItemsValidator
   | AdditionalAllForbidden
   deriving (Eq, Show, Ord)
 
+instance JSON.FromJSON AdditionalItemsValidator where
+  parseJSON raw
+    = (AdditionalSingleSchema <$> JSON.parseJSON raw)
+    <|> (AdditionalMultipleSchemas <$> JSON.parseJSON raw)
+    <|> JSON.withBool "additionalItems"
+      (\b -> pure $ if b then AdditionalAllAllowed else AdditionalAllForbidden)
+      raw
+
+data UniqueItems
+  = ItemsCanBeDuplicated
+  | ItemsMustBeUnique
+  deriving (Eq, Show, Ord)
+
+instance JSON.FromJSON UniqueItems where
+  parseJSON = JSON.withBool "unique items" $ \b ->
+    pure $ if b
+      then ItemsMustBeUnique
+      else ItemsCanBeDuplicated
+
 parseArrayValidator :: JSON.Object -> JSON.Parser ArrayValidator
 parseArrayValidator o = do
   avMinItems <- o .:? "minItems"
   avMaxItems <- o .:? "maxItems"
-  avItems <- parseItemsValidator (Map.lookup "items" o)
-  avAdditionalItems <- parseAdditionalItemsValidator (Map.lookup "additionalItems" o)
+  avItems <- o .:? "items" .!= NoItemsValidator
+  avAdditionalItems <- o .:? "additionalItems" .!= AdditionalAllAllowed
+  avUniqueItems <- o .:? "uniqueItems" .!= ItemsCanBeDuplicated
 
-  case (avMinItems, avMaxItems, avItems, avAdditionalItems) of
-    (Nothing, Nothing, NoItemsValidator, AdditionalAllAllowed) -> fail "no array properties to validate"
+  case (avMinItems, avMaxItems, avItems, avAdditionalItems, avUniqueItems) of
+    (Nothing, Nothing, NoItemsValidator, AdditionalAllAllowed, ItemsCanBeDuplicated)
+      -> fail "no array properties to validate"
     _ -> pure $ ArrayValidator{..}
-
-  where
-    parseItemsValidator = \case
-      Nothing -> pure NoItemsValidator
-      Just jsonValue ->
-        (SingleSchema <$> JSON.parseJSON jsonValue)
-        <|> (MultipleSchemas <$> JSON.parseJSON jsonValue)
-
-    parseAdditionalItemsValidator = \case
-      Nothing -> pure AdditionalAllAllowed
-      Just jsonValue ->
-        (AdditionalSingleSchema <$> JSON.parseJSON jsonValue)
-        <|> (AdditionalMultipleSchemas <$> JSON.parseJSON jsonValue)
-        <|> parseBool jsonValue
-
-    parseBool = \case
-      JSON.Bool b -> if b
-        then pure AdditionalAllAllowed
-        else pure AdditionalAllForbidden
-      _ -> fail "not a boolean for additionalItems keyword"
 
 data NumericValidator = NumericValidator
   { nvMultipleOf       :: Maybe Scientific

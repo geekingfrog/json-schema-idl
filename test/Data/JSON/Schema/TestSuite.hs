@@ -112,7 +112,7 @@ buildTestSuites = do
     -- , "refRemote.json"
     -- , "required.json"
     , "type.json"
-    -- , "uniqueItems.json"
+    , "uniqueItems.json"
     ]
 
   pure $ T.testGroup "JSON schema official test suite" tests

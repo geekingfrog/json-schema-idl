@@ -70,6 +70,7 @@ parsingTests = T.testGroup "parsing"
             , Sc.avMaxItems        = Just 5
             , Sc.avItems           = Sc.NoItemsValidator
             , Sc.avAdditionalItems = Sc.AdditionalAllAllowed
+            , Sc.avUniqueItems     = Sc.ItemsCanBeDuplicated
             }
       let fooSchema = Sc.Schema Nothing Nothing $ V.singleton typeValidator
       let barSchema = Sc.Schema Nothing Nothing $ V.fromList

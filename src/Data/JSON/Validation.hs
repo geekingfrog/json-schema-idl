@@ -17,7 +17,8 @@ import           Data.Functor.Alt
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Map.Strict     as OrdMap
 import qualified Data.Scientific     as Scientific
-import qualified Data.Set            as Set
+import qualified Data.Set            as OrdSet
+import qualified Data.HashSet        as Set
 import           Data.Text           (Text)
 import qualified Data.Text           as Tx
 import qualified Data.Traversable    as T
@@ -136,11 +137,11 @@ validateObject value valObj = case value of
     -- keys covered neither by `properties` nor by `patternProperties`
     getAdditionalKeyValues :: JSON.Object -> Sc.ObjectValidator -> [(Text, JSON.Value)]
     getAdditionalKeyValues obj valObj =
-      let existingKeys = Set.fromList $ Map.keys obj
-          allowedKeys = Set.fromList (Map.keys $ Sc.ovProperties valObj)
-          allAdditionalKeys = Set.difference existingKeys allowedKeys
+      let existingKeys = OrdSet.fromList $ Map.keys obj
+          allowedKeys = OrdSet.fromList (Map.keys $ Sc.ovProperties valObj)
+          allAdditionalKeys = OrdSet.difference existingKeys allowedKeys
           allPatterns = OrdMap.keys (Sc.ovPatternProps valObj)
-          additionalKeys = filter (\k -> not $ F.any (k =~) allPatterns) (Set.toList allAdditionalKeys)
+          additionalKeys = filter (\k -> not $ F.any (k =~) allPatterns) (OrdSet.toList allAdditionalKeys)
       in Mb.mapMaybe (\k -> (k,) <$> Map.lookup k obj) additionalKeys
 
 validateBoolean :: Bool -> ValidationOutcome ()
@@ -154,6 +155,7 @@ validateArray value valA = case value of
     [ validateMaxItems arr valA
     , validateMinItems arr valA
     , validateItems arr valA
+    , validateUnique arr valA
     ]
   _ -> pure ()
 
@@ -199,6 +201,11 @@ validateArray value valA = case value of
 
       Sc.NoItemsValidator -> pure ()
 
+    validateUnique a v = case Sc.avUniqueItems v of
+      Sc.ItemsCanBeDuplicated -> pure ()
+      Sc.ItemsMustBeUnique -> if length (Set.fromList $ V.toList a) == length a
+        then pure ()
+        else Error $ ValidationErrors ["Items aren't unique"]
 
 validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValidationOutcome ()
 validateNumeric value valN = case value of
