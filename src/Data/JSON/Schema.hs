@@ -7,7 +7,7 @@
 module Data.JSON.Schema where
 
 import           Control.Applicative
-import           Data.Aeson            ((.!=), (.:), (.:?))
+import           Data.Aeson            ((.!=), (.:), (.:?), (.:!))
 import qualified Data.Aeson            as JSON
 import qualified Data.Aeson.Types      as JSON
 import qualified Data.Char             as Chr
@@ -73,7 +73,7 @@ data Schema = Schema
   , sTitle :: Maybe Text
   , sValidators :: V.Vector Validator
   }
-  deriving (Eq, Show, Ord, Generic)
+  deriving (Eq, Show, Generic)
 
 instance JSON.FromJSON Schema where
   parseJSON raw
@@ -90,28 +90,37 @@ instance JSON.FromJSON Schema where
       parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
 
 data Validator
-  = ValType TypeValidator
+  = ValAny AnyValidator
   | ValObject ObjectValidator
   | ValBool Bool
   | ValArray ArrayValidator
   | ValNumeric NumericValidator
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 parseAllValidators :: JSON.Object -> JSON.Parser (V.Vector Validator)
 parseAllValidators o = do
   vals <- traverse optional
-    [ ValType <$> parseTypeValidator o
+    [ ValAny <$> parseAnyValidator o
     , ValObject <$> parseObjectValidator o
     , ValArray <$> parseArrayValidator o
     , ValNumeric <$> parseNumericValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
+data AnyValidator = AnyValidator
+  { anyType :: Maybe TypeValidator
+  -- , anyEnum :: EnumValidator
+  , anyConst :: Maybe JSON.Value
+  }
+  deriving (Eq, Show)
 
 data TypeValidator
   = OneType PrimitiveType
   | MultipleTypes (V.Vector PrimitiveType)
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
+
+instance JSON.FromJSON TypeValidator where
+  parseJSON raw = (OneType <$> JSON.parseJSON raw) <|> (MultipleTypes <$> JSON.parseJSON raw)
 
 data PrimitiveType
   = PTNull
@@ -121,7 +130,7 @@ data PrimitiveType
   | PTNumber
   | PTInteger
   | PTString
-  deriving (Eq, Show, Ord, Generic)
+  deriving (Eq, Show, Generic)
 
 prettyPrimitiveType :: PrimitiveType -> Text
 prettyPrimitiveType = \case
@@ -143,17 +152,25 @@ instance JSON.FromJSON PrimitiveType where
     { JSON.constructorTagModifier = (\(x:xs) -> Chr.toLower x : xs) . drop 2
     }
 
-parseTypeValidator :: JSON.Object -> JSON.Parser TypeValidator
-parseTypeValidator o = o .:? "type" >>= \case
-  Nothing -> fail "No `type` key found"
-  Just typVal -> parseOneType typVal <|> parseMultipleTypes typVal
+parseAnyValidator :: JSON.Object -> JSON.Parser AnyValidator
+parseAnyValidator o = do
+  anyType <- o .:? "type"
+  anyConst <- o .:! "const"
+  case (anyType, anyConst) of
+    (Nothing, Nothing) -> fail "no validation properties present"
+    _ -> pure $ AnyValidator{..}
 
-    where
-      parseOneType :: JSON.Value -> JSON.Parser TypeValidator
-      parseOneType = fmap OneType . JSON.parseJSON
-
-      parseMultipleTypes :: JSON.Value -> JSON.Parser TypeValidator
-      parseMultipleTypes = fmap MultipleTypes . JSON.parseJSON
+-- parseTypeValidator :: JSON.Object -> JSON.Parser TypeValidator
+-- parseTypeValidator o = o .:? "type" >>= \case
+--   Nothing -> fail "No `type` key found"
+--   Just typVal -> parseOneType typVal <|> parseMultipleTypes typVal
+--
+--     where
+--       parseOneType :: JSON.Value -> JSON.Parser TypeValidator
+--       parseOneType = fmap OneType . JSON.parseJSON
+--
+--       parseMultipleTypes :: JSON.Value -> JSON.Parser TypeValidator
+--       parseMultipleTypes = fmap MultipleTypes . JSON.parseJSON
 
 
 data ObjectValidator = ObjectValidator
@@ -161,13 +178,13 @@ data ObjectValidator = ObjectValidator
   , ovAdditionalProps :: AdditionalProperties
   , ovPatternProps    :: OrdMap.Map RE.Regex Schema
   }
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 data AdditionalProperties
   = NoAdditionalProperties
   | SomeAdditionalProperties Schema
   | AllAdditionalProperties
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 parseObjectValidator :: JSON.Object -> JSON.Parser ObjectValidator
 parseObjectValidator o = do
@@ -212,14 +229,15 @@ data ArrayValidator = ArrayValidator
   , avItems           :: ItemsValidator
   , avAdditionalItems :: AdditionalItemsValidator
   , avUniqueItems     :: UniqueItems
+  , avContainsItem    :: Maybe Schema
   }
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 data ItemsValidator
   = SingleSchema Schema
   | MultipleSchemas (V.Vector Schema)
   | NoItemsValidator
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 instance JSON.FromJSON ItemsValidator where
   parseJSON raw
@@ -231,7 +249,7 @@ data AdditionalItemsValidator
   | AdditionalMultipleSchemas (V.Vector Schema)
   | AdditionalAllAllowed
   | AdditionalAllForbidden
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 instance JSON.FromJSON AdditionalItemsValidator where
   parseJSON raw
@@ -244,7 +262,7 @@ instance JSON.FromJSON AdditionalItemsValidator where
 data UniqueItems
   = ItemsCanBeDuplicated
   | ItemsMustBeUnique
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 instance JSON.FromJSON UniqueItems where
   parseJSON = JSON.withBool "unique items" $ \b ->
@@ -259,9 +277,10 @@ parseArrayValidator o = do
   avItems <- o .:? "items" .!= NoItemsValidator
   avAdditionalItems <- o .:? "additionalItems" .!= AdditionalAllAllowed
   avUniqueItems <- o .:? "uniqueItems" .!= ItemsCanBeDuplicated
+  avContainsItem <- o .:? "contains"
 
-  case (avMinItems, avMaxItems, avItems, avAdditionalItems, avUniqueItems) of
-    (Nothing, Nothing, NoItemsValidator, AdditionalAllAllowed, ItemsCanBeDuplicated)
+  case (avMinItems, avMaxItems, avItems, avAdditionalItems, avUniqueItems, avContainsItem) of
+    (Nothing, Nothing, NoItemsValidator, AdditionalAllAllowed, ItemsCanBeDuplicated, Nothing)
       -> fail "no array properties to validate"
     _ -> pure $ ArrayValidator{..}
 
@@ -272,7 +291,7 @@ data NumericValidator = NumericValidator
   , nvExclusiveMinimum :: Maybe Scientific
   , nvExclusiveMaximum :: Maybe Scientific
   }
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Show)
 
 parseNumericValidator :: JSON.Object -> JSON.Parser NumericValidator
 parseNumericValidator o = do

@@ -24,6 +24,7 @@ import qualified Data.Text           as Tx
 import qualified Data.Traversable    as T
 import qualified Data.Typeable       as Typeable
 import qualified Data.Vector         as V
+import Control.Applicative
 
 import qualified Data.JSON.Schema    as Sc
 
@@ -47,6 +48,10 @@ instance Alt ValidationOutcome where
     (Error a, Error b) -> Error (a <> b)
   {-# INLINE (<!>) #-}
 
+instance Alternative ValidationOutcome where
+  a <|> b = a <!> b
+  empty = Error mempty
+
 instance F.Foldable ValidationOutcome where
   foldr f x (Ok a) = f a x
   foldr _ x (Error _) = x
@@ -68,11 +73,23 @@ validate schema val = traverse (validate' val) (Sc.sValidators $ Sc.schema schem
 
 validate' :: JSON.Value -> Sc.Validator -> ValidationOutcome ()
 validate' value = \case
-  Sc.ValType valType -> validateType value valType
+  Sc.ValAny valAny -> validateAny value valAny
   Sc.ValObject valObj -> validateObject value valObj
   Sc.ValBool b -> validateBoolean b
   Sc.ValArray valA -> validateArray value valA
   Sc.ValNumeric valN -> validateNumeric value valN
+
+
+validateAny :: JSON.Value -> Sc.AnyValidator -> ValidationOutcome ()
+validateAny value valAny = F.traverse_ id
+  [ maybe (pure ()) (validateType value) (Sc.anyType valAny)
+  , maybe (pure ()) (validateConst value) (Sc.anyConst valAny)
+  ]
+
+  where
+    validateConst val constVal = if val == constVal
+      then Ok ()
+      else Error $ ValidationErrors ["Not equal to const"]
 
 
 validateType :: JSON.Value -> Sc.TypeValidator -> ValidationOutcome ()
@@ -156,6 +173,7 @@ validateArray value valA = case value of
     , validateMinItems arr valA
     , validateItems arr valA
     , validateUnique arr valA
+    , validateContains arr valA
     ]
   _ -> pure ()
 
@@ -206,6 +224,10 @@ validateArray value valA = case value of
       Sc.ItemsMustBeUnique -> if length (Set.fromList $ V.toList a) == length a
         then pure ()
         else Error $ ValidationErrors ["Items aren't unique"]
+
+    validateContains a v = case Sc.avContainsItem v of
+      Nothing -> pure ()
+      Just schema -> void $ F.asum $ fmap (validate (Sc.SubSchema schema)) a
 
 validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValidationOutcome ()
 validateNumeric value valN = case value of
