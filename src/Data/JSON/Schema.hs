@@ -1,3 +1,4 @@
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -6,6 +7,8 @@
 
 module Data.JSON.Schema where
 
+import Control.Monad (when)
+import qualified Data.HashSet as Set
 import           Control.Applicative
 import           Data.Aeson            ((.!=), (.:), (.:?), (.:!))
 import qualified Data.Aeson            as JSON
@@ -161,25 +164,24 @@ parseAnyValidator o = do
     then pure Nothing
     else pure $ Just $ AnyValidator{..}
 
--- parseTypeValidator :: JSON.Object -> JSON.Parser TypeValidator
--- parseTypeValidator o = o .:? "type" >>= \case
---   Nothing -> fail "No `type` key found"
---   Just typVal -> parseOneType typVal <|> parseMultipleTypes typVal
---
---     where
---       parseOneType :: JSON.Value -> JSON.Parser TypeValidator
---       parseOneType = fmap OneType . JSON.parseJSON
---
---       parseMultipleTypes :: JSON.Value -> JSON.Parser TypeValidator
---       parseMultipleTypes = fmap MultipleTypes . JSON.parseJSON
-
-
 data ObjectValidator = ObjectValidator
   { ovProperties      :: Map.HashMap Text Schema
   , ovAdditionalProps :: AdditionalProperties
   , ovPatternProps    :: OrdMap.Map RE.Regex Schema
+  , ovRequired        :: RequiredProperties
+  , ovMinProps        :: Maybe Int
+  , ovMaxProps        :: Maybe Int
   }
   deriving (Eq, Show)
+
+newtype Positive a = Positive { getPositive :: a }
+  deriving stock (Eq, Show)
+
+instance (Ord a, Num a, JSON.FromJSON a) => JSON.FromJSON (Positive a) where
+  parseJSON v = do
+    n <- JSON.parseJSON v
+    when (n < 0) $ fail "Positive requires a positive numeric"
+    pure $ Positive n
 
 data AdditionalProperties
   = NoAdditionalProperties
@@ -187,18 +189,33 @@ data AdditionalProperties
   | AllAdditionalProperties
   deriving (Eq, Show)
 
+newtype RequiredProperties = RequiredProperties
+  { getRequiredProperties :: V.Vector Text }
+  deriving (Eq, Show)
+
+instance JSON.FromJSON RequiredProperties where
+  parseJSON val = do
+    elems <- JSON.parseJSON val
+    when (length elems /= length (Set.fromList $ V.toList elems)) $
+      fail "requiredProperties must all be unique"
+    pure $ RequiredProperties elems
+
 parseObjectValidator :: JSON.Object -> JSON.Parser (Maybe ObjectValidator)
 parseObjectValidator o = do
-  props <- o .:? "properties" .!= mempty
-  ap <- parseAdditionalProperties o
-  patterns <- parsePatternProperties o
-  if ap == AllAdditionalProperties && Map.null props && OrdMap.null patterns
+  ovProperties <- o .:? "properties" .!= mempty
+  ovAdditionalProps <- parseAdditionalProperties o
+  ovPatternProps <- parsePatternProperties o
+  ovRequired <- o .:? "required" .!= RequiredProperties mempty
+  ovMinProps <- fmap getPositive <$> o .:? "minProperties"
+  ovMaxProps <- fmap getPositive <$> o .:? "maxProperties"
+  if ovAdditionalProps == AllAdditionalProperties
+       && Map.null ovProperties
+       && OrdMap.null ovPatternProps
+       && V.null (getRequiredProperties ovRequired)
+       && Mb.isNothing ovMinProps
+       && Mb.isNothing ovMaxProps
     then pure Nothing
-    else pure $ Just $ ObjectValidator
-           { ovProperties = props
-           , ovAdditionalProps = ap
-           , ovPatternProps = patterns
-           }
+    else pure $ Just $ ObjectValidator{..}
 
 parseAdditionalProperties :: JSON.Object -> JSON.Parser AdditionalProperties
 parseAdditionalProperties o = o .:? "additionalProperties" >>= \case

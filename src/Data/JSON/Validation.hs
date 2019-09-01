@@ -150,30 +150,30 @@ validateAny :: JSON.Value -> Sc.AnyValidator -> ValM ()
 validateAny value valAny = do
   resultType <- runMbValidator (validateType value) (Sc.anyType valAny)
   resultConst <- runMbValidator (validateConst value) (Sc.anyConst valAny)
-  pure $ F.traverse_ id [resultType, resultConst]
+  resultEnum <- validateEnum value (Sc.anyEnum valAny)
 
--- validateAny value valAny = F.traverse_ id
---   [ maybe (pure $ pure ()) (validateType value) (Sc.anyType valAny)
---   -- , validateEnum value (Sc.anyEnum valAny)
---   -- , maybe (pure ()) (validateConst value) (Sc.anyConst valAny)
---   ]
+  pure $ F.traverse_ id
+    [ resultType
+    , resultConst
+    , resultEnum
+    ]
 
   where
-    validateConst :: JSON.Value -> JSON.Value -> ValM ()
-    validateConst val constVal = if val == constVal
-      then pure $ Ok ()
-      else Rdr.ask >>= \env -> pure $ Error [ValidationError
-        { verrKeyword = "const"
-        , verrMessage = "should be equal to constant"
-        , verrParams  = constVal
-        , verrDataPath = veDataPath env
-        , verrSchemaPath = veSchemaPath env
-        }]
+    validateConst val constVal = Rdr.local (addSchemaPath "const") $
+      if val == constVal
+        then pure $ Ok ()
+        else mkValidationError
+          "const"
+          "should be equal to constant"
+          (JSON.Object $ Map.singleton "allowedValue" constVal)
 
-    -- validateEnum val possibleVals = if V.null possibleVals || F.any (== val) possibleVals
-    --   then Ok ()
-    --   else Error $ ValidationErrors [Tx.pack $ "Not equal to any value in enum: " <> show val]
-
+    validateEnum val possibleVals = Rdr.local (addSchemaPath "enum") $
+      if V.null possibleVals || F.any (== val) possibleVals
+        then pure $ Ok ()
+        else mkValidationError
+          "enum"
+          "should be equal to one of the allowed value"
+          val
 
 validateType :: JSON.Value -> Sc.TypeValidator -> ValM ()
 validateType value valType = Rdr.local (addSchemaPath "type") $
@@ -212,7 +212,18 @@ validateObject value valObj = case value of
     resultProp <- F.traverse_ id <$> Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
     resultAdditionalProps <- validateAdditionalProps o valObj
     resultPatternProps <- validatePatternProps o (Sc.ovPatternProps valObj)
-    pure $ F.traverse_ id [resultProp]
+    resultRequired <- validateRequired o (Sc.ovRequired valObj)
+    resultMinProps <- runMbValidator (validateMinProps o) (Sc.ovMinProps valObj)
+    resultMaxProps <- runMbValidator (validateMaxProps o) (Sc.ovMaxProps valObj)
+
+    pure $ F.traverse_ id
+      [ resultProp
+      , resultAdditionalProps
+      , resultPatternProps
+      , resultRequired
+      , resultMinProps
+      , resultMaxProps
+      ]
   _ -> pure $ pure ()
 
   where
@@ -239,13 +250,14 @@ validateObject value valObj = case value of
             additionalKeyVals
           pure $ F.traverse_ id result
 
-    validatePatternProps o patternProps = Rdr.local (addSchemaPath "patternProperties") $
-      F.traverse_ (validateOnePatternProp o) (OrdMap.toList patternProps)
+    validatePatternProps o patternProps = Rdr.local (addSchemaPath "patternProperties") $ do
+      results <- traverse (validateOnePatternProp o) (OrdMap.toList patternProps)
+      pure $ F.traverse_ (traverse id . Map.elems) results
 
-    validateOnePatternProp o (regexp, schema) = void $ Map.traverseWithKey
+    validateOnePatternProp o (regexp, schema) = Map.traverseWithKey
       (\k v -> if k =~ regexp
-                 then void (Rdr.local (addDataPath k) $ validate (Sc.SubSchema schema) v)
-                 else pure ()
+                 then Rdr.local (addDataPath k) $ void <$> validate (Sc.SubSchema schema) v
+                 else pure $ Ok ()
       )
       o
 
@@ -259,6 +271,26 @@ validateObject value valObj = case value of
           allPatterns = OrdMap.keys (Sc.ovPatternProps valObj)
           additionalKeys = filter (\k -> not $ F.any (k =~) allPatterns) (OrdSet.toList allAdditionalKeys)
       in Mb.mapMaybe (\k -> (k,) <$> Map.lookup k obj) additionalKeys
+
+    validateRequired o (Sc.RequiredProperties req) = Rdr.local (addSchemaPath "required") $
+      if F.all (`Map.member` o) req
+        then pure $ Ok ()
+        else mkValidationError
+          "required"
+          ("should have required properties " <> Tx.intercalate ", " (V.toList req))
+          (JSON.Object $ Map.singleton "requiredProperties" (JSON.Array $ fmap JSON.String req))
+
+    validateNum pred keyword msg o limit = Rdr.local (addSchemaPath keyword) $
+      if pred (length $ Map.keys o) limit
+        then pure $ Ok ()
+        else mkValidationError
+          keyword
+          (msg <> " " <> Tx.pack (show limit) <> " properties")
+          (JSON.Object $ Map.singleton "limit" (mkJSONNum limit))
+
+    validateMinProps = validateNum (>=) "minProperties" "should NOT have fewer than"
+    validateMaxProps = validateNum (<=) "maxProperties" "should NOT have less than"
+
 
 validateBoolean :: Bool -> ValM ()
 validateBoolean b = if b
@@ -299,8 +331,6 @@ validateArray value valA = case value of
           "minItems"
           ("should NOT have less than " <> Tx.pack (show limit) <> " items")
           (JSON.Object $ Map.singleton "limit" (mkJSONNum limit))
-
-    mkJSONNum x = JSON.Number $ Scientific.scientific (fromIntegral x) 0
 
     iTraverse :: Applicative f => ((Int, a) -> f b) -> V.Vector a -> f (V.Vector b)
     iTraverse f vec =
@@ -424,3 +454,7 @@ validateNumeric value valN = case value of
     validateMaximum = assert (<=) "maximum" "must be less than"
     validateExclusiveMinimum = assert (>) "exclusiveMinimum" "must be strictly greater than"
     validateExclusiveMaximum = assert (<) "exclusiveMaximum" "must be strictly less than"
+
+
+mkJSONNum :: Int -> JSON.Value
+mkJSONNum x = JSON.Number $ Scientific.scientific (fromIntegral x) 0
