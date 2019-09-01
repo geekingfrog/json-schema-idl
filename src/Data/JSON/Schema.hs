@@ -1,7 +1,7 @@
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE StrictData        #-}
 
 module Data.JSON.Schema where
@@ -30,8 +30,8 @@ data JSONSchema
 
 instance JSON.FromJSON JSONSchema where
   parseJSON raw
-    = JSON.withObject "object JSONschema" parseObject raw
-    <|> JSON.withBool "boolean JSONschema" parseBool raw
+    = JSON.withBool "boolean JSONschema" parseBool raw
+    <|> JSON.withObject "object JSONschema" parseObject raw
 
     where
       parseObject o = do
@@ -77,8 +77,8 @@ data Schema = Schema
 
 instance JSON.FromJSON Schema where
   parseJSON raw
-    = JSON.withObject "object subschema" parseObject raw
-    <|> JSON.withBool "boolean subschema" parseBool raw
+    = JSON.withBool "boolean subschema" parseBool raw
+    <|> JSON.withObject "object subschema" parseObject raw
 
     where
       parseObject o = do
@@ -99,17 +99,17 @@ data Validator
 
 parseAllValidators :: JSON.Object -> JSON.Parser (V.Vector Validator)
 parseAllValidators o = do
-  vals <- traverse optional
-    [ ValAny <$> parseAnyValidator o
-    , ValObject <$> parseObjectValidator o
-    , ValArray <$> parseArrayValidator o
-    , ValNumeric <$> parseNumericValidator o
+  vals <- sequence
+    [ fmap ValAny <$> parseAnyValidator o
+    , fmap ValObject <$> parseObjectValidator o
+    , fmap ValArray <$> parseArrayValidator o
+    , fmap ValNumeric <$> parseNumericValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
 data AnyValidator = AnyValidator
-  { anyType :: Maybe TypeValidator
-  -- , anyEnum :: EnumValidator
+  { anyType  :: Maybe TypeValidator
+  , anyEnum  :: V.Vector JSON.Value
   , anyConst :: Maybe JSON.Value
   }
   deriving (Eq, Show)
@@ -152,13 +152,14 @@ instance JSON.FromJSON PrimitiveType where
     { JSON.constructorTagModifier = (\(x:xs) -> Chr.toLower x : xs) . drop 2
     }
 
-parseAnyValidator :: JSON.Object -> JSON.Parser AnyValidator
+parseAnyValidator :: JSON.Object -> JSON.Parser (Maybe AnyValidator)
 parseAnyValidator o = do
   anyType <- o .:? "type"
+  anyEnum <- o .:? "enum" .!= mempty
   anyConst <- o .:! "const"
-  case (anyType, anyConst) of
-    (Nothing, Nothing) -> fail "no validation properties present"
-    _ -> pure $ AnyValidator{..}
+  if Mb.isNothing anyType && Mb.isNothing anyConst && V.null anyEnum
+    then pure Nothing
+    else pure $ Just $ AnyValidator{..}
 
 -- parseTypeValidator :: JSON.Object -> JSON.Parser TypeValidator
 -- parseTypeValidator o = o .:? "type" >>= \case
@@ -186,14 +187,14 @@ data AdditionalProperties
   | AllAdditionalProperties
   deriving (Eq, Show)
 
-parseObjectValidator :: JSON.Object -> JSON.Parser ObjectValidator
+parseObjectValidator :: JSON.Object -> JSON.Parser (Maybe ObjectValidator)
 parseObjectValidator o = do
   props <- o .:? "properties" .!= mempty
   ap <- parseAdditionalProperties o
   patterns <- parsePatternProperties o
   if ap == AllAdditionalProperties && Map.null props && OrdMap.null patterns
-    then fail "no validation properties present"
-    else pure $ ObjectValidator
+    then pure Nothing
+    else pure $ Just $ ObjectValidator
            { ovProperties = props
            , ovAdditionalProps = ap
            , ovPatternProps = patterns
@@ -270,7 +271,7 @@ instance JSON.FromJSON UniqueItems where
       then ItemsMustBeUnique
       else ItemsCanBeDuplicated
 
-parseArrayValidator :: JSON.Object -> JSON.Parser ArrayValidator
+parseArrayValidator :: JSON.Object -> JSON.Parser (Maybe ArrayValidator)
 parseArrayValidator o = do
   avMinItems <- o .:? "minItems"
   avMaxItems <- o .:? "maxItems"
@@ -281,8 +282,8 @@ parseArrayValidator o = do
 
   case (avMinItems, avMaxItems, avItems, avAdditionalItems, avUniqueItems, avContainsItem) of
     (Nothing, Nothing, NoItemsValidator, AdditionalAllAllowed, ItemsCanBeDuplicated, Nothing)
-      -> fail "no array properties to validate"
-    _ -> pure $ ArrayValidator{..}
+      -> pure Nothing
+    _ -> pure $ Just $ ArrayValidator{..}
 
 data NumericValidator = NumericValidator
   { nvMultipleOf       :: Maybe Scientific
@@ -293,7 +294,7 @@ data NumericValidator = NumericValidator
   }
   deriving (Eq, Show)
 
-parseNumericValidator :: JSON.Object -> JSON.Parser NumericValidator
+parseNumericValidator :: JSON.Object -> JSON.Parser (Maybe NumericValidator)
 parseNumericValidator o = do
   nvMultipleOf       <- o .:? "multipleOf"
   nvMinimum          <- o .:? "minimum"
@@ -301,5 +302,5 @@ parseNumericValidator o = do
   nvExclusiveMinimum <- o .:? "exclusiveMinimum"
   nvExclusiveMaximum <- o .:? "exclusiveMaximum"
   case nvMultipleOf <|> nvMinimum <|> nvMaximum <|> nvExclusiveMinimum <|> nvExclusiveMaximum of
-    Nothing -> fail "no numeric validator"
-    Just _ -> pure NumericValidator{..}
+    Nothing -> pure Nothing
+    Just _ -> pure $ Just NumericValidator{..}

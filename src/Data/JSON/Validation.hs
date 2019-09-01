@@ -1,16 +1,25 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DeriveFunctor       #-}
+{-# LANGUAGE DerivingVia         #-}
+{-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE DeriveFunctor     #-}
-{-# LANGUAGE DerivingVia       #-}
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData          #-}
+{-# LANGUAGE TupleSections       #-}
 
 module Data.JSON.Validation where
 
+import Debug.Trace
+
+import GHC.Generics
 import qualified Data.Maybe as Mb
 import           Text.Regex.PCRE.Heavy ((=~))
 import qualified Data.Aeson          as JSON
+import qualified Data.Aeson.Text     as JSON.Tx
 import qualified Data.Foldable       as F
 import           Data.Functor        (void, ($>))
 import           Data.Functor.Alt
@@ -20,18 +29,21 @@ import qualified Data.Scientific     as Scientific
 import qualified Data.Set            as OrdSet
 import qualified Data.HashSet        as Set
 import           Data.Text           (Text)
+import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Text           as Tx
+import qualified Data.Text.Lazy      as LTx
 import qualified Data.Traversable    as T
 import qualified Data.Typeable       as Typeable
 import qualified Data.Vector         as V
 import Control.Applicative
+import qualified Control.Monad.Reader as Rdr
 
 import qualified Data.JSON.Schema    as Sc
 
 -- Data.Validation on hackage requires lens oÔ so let's roll our own simple version
 data ValidationOutcome a
   = Ok a
-  | Error ValidationErrors
+  | Error [ValidationError]
   deriving (Eq, Show, Functor)
 
 instance Applicative ValidationOutcome where
@@ -45,7 +57,7 @@ instance Alt ValidationOutcome where
   a <!> b = case (a, b) of
     (Ok x, _) -> Ok x
     (_, Ok y) -> Ok y
-    (Error a, Error b) -> Error (a <> b)
+    (Error a, _) -> Error a
   {-# INLINE (<!>) #-}
 
 instance Alternative ValidationOutcome where
@@ -63,15 +75,69 @@ instance T.Traversable ValidationOutcome where
     (Error err) -> pure (Error err)
   {-# INLINE traverse #-}
 
-newtype ValidationErrors = ValidationErrors { getValidatorErrors :: [Text] }
+prettyValidationOutcome :: Show a => ValidationOutcome a -> Text
+prettyValidationOutcome = \case
+  Ok a -> "Ok " <> Tx.pack (show a)
+  Error errors -> "Errors: [" <> Tx.intercalate " - " (fmap prettyError errors) <> "]"
+
+  where
+    prettyError :: ValidationError -> Text
+    prettyError err = Tx.intercalate ", "
+      [ "keyword: \"" <> verrKeyword err <> "\""
+      , "message: \"" <> verrMessage err <> "\""
+      , "dataPath: \"." <> Tx.intercalate "." (reverse $ verrDataPath err) <> "\""
+      , "schemaPath: \"#/" <> Tx.intercalate "/" (reverse $ verrSchemaPath err) <> "\""
+      , "params: " <> LTx.toStrict (JSON.Tx.encodeToLazyText $ verrParams err)
+      ]
+
+data ValidationError = ValidationError
+  { verrKeyword :: Text
+  , verrMessage :: Text
+  , verrParams  :: JSON.Value
+  , verrDataPath :: [Text]
+  , verrSchemaPath :: [Text]
+  }
+  deriving (Eq, Show, Generic, JSON.ToJSON)
+
+mkValidationError :: Text -> Text -> JSON.Value -> ValM a
+mkValidationError keyword msg params = Rdr.ask >>= \env -> pure $ Error [ValidationError
+  { verrKeyword    = keyword
+  , verrMessage    = msg
+  , verrParams     = params
+  , verrDataPath   = veDataPath env
+  , verrSchemaPath = veSchemaPath env
+  }]
+
+data ValidationEnv = ValidationEnv
+  { veDataPath :: [Text]
+  , veSchemaPath :: [Text]
+  }
   deriving (Eq, Show)
-  deriving (Semigroup, Monoid) via [Text]
 
+emptyValidationEnv :: ValidationEnv
+emptyValidationEnv = ValidationEnv [] []
 
-validate :: Sc.JSONSchema -> JSON.Value -> ValidationOutcome JSON.Value
-validate schema val = traverse (validate' val) (Sc.sValidators $ Sc.schema schema) $> val
+addSchemaPath, addDataPath :: Text -> ValidationEnv -> ValidationEnv
+addSchemaPath path env = env {veSchemaPath = path : veSchemaPath env}
+addDataPath path env = env {veDataPath = path : veDataPath env}
 
-validate' :: JSON.Value -> Sc.Validator -> ValidationOutcome ()
+newtype ValidationM a = ValidationM { runValidationM :: Rdr.Reader ValidationEnv a }
+  deriving newtype (Functor, Applicative, Monad, Rdr.MonadReader ValidationEnv)
+
+type ValM a = ValidationM (ValidationOutcome a)
+
+runValidation :: ValidationM a -> ValidationEnv -> a
+runValidation m = Rdr.runReader (runValidationM m)
+
+runMbValidator :: (a -> ValM ()) -> Maybe a -> ValM ()
+runMbValidator = maybe (pure $ pure ())
+
+validate :: Sc.JSONSchema -> JSON.Value -> ValM JSON.Value
+validate schema val = do
+  valResults <- traverse (validate' val) (Sc.sValidators $ Sc.schema schema)
+  pure $ traverse id valResults $> val
+
+validate' :: JSON.Value -> Sc.Validator -> ValM ()
 validate' value = \case
   Sc.ValAny valAny -> validateAny value valAny
   Sc.ValObject valObj -> validateObject value valObj
@@ -80,26 +146,43 @@ validate' value = \case
   Sc.ValNumeric valN -> validateNumeric value valN
 
 
-validateAny :: JSON.Value -> Sc.AnyValidator -> ValidationOutcome ()
-validateAny value valAny = F.traverse_ id
-  [ maybe (pure ()) (validateType value) (Sc.anyType valAny)
-  , maybe (pure ()) (validateConst value) (Sc.anyConst valAny)
-  ]
+validateAny :: JSON.Value -> Sc.AnyValidator -> ValM ()
+validateAny value valAny = do
+  resultType <- runMbValidator (validateType value) (Sc.anyType valAny)
+  resultConst <- runMbValidator (validateConst value) (Sc.anyConst valAny)
+  pure $ F.traverse_ id [resultType, resultConst]
+
+-- validateAny value valAny = F.traverse_ id
+--   [ maybe (pure $ pure ()) (validateType value) (Sc.anyType valAny)
+--   -- , validateEnum value (Sc.anyEnum valAny)
+--   -- , maybe (pure ()) (validateConst value) (Sc.anyConst valAny)
+--   ]
 
   where
+    validateConst :: JSON.Value -> JSON.Value -> ValM ()
     validateConst val constVal = if val == constVal
-      then Ok ()
-      else Error $ ValidationErrors ["Not equal to const"]
+      then pure $ Ok ()
+      else Rdr.ask >>= \env -> pure $ Error [ValidationError
+        { verrKeyword = "const"
+        , verrMessage = "should be equal to constant"
+        , verrParams  = constVal
+        , verrDataPath = veDataPath env
+        , verrSchemaPath = veSchemaPath env
+        }]
+
+    -- validateEnum val possibleVals = if V.null possibleVals || F.any (== val) possibleVals
+    --   then Ok ()
+    --   else Error $ ValidationErrors [Tx.pack $ "Not equal to any value in enum: " <> show val]
 
 
-validateType :: JSON.Value -> Sc.TypeValidator -> ValidationOutcome ()
-validateType value valType =
+validateType :: JSON.Value -> Sc.TypeValidator -> ValM ()
+validateType value valType = Rdr.local (addSchemaPath "type") $
   let acceptableTypes = case valType of
         Sc.OneType t -> V.singleton t
         Sc.MultipleTypes typs -> typs
       want t = if t `V.elem` acceptableTypes
-        then Ok ()
-        else Error $ mkError acceptableTypes t
+        then pure $ Ok ()
+        else mkError acceptableTypes t
   in case value of
       JSON.Object _ -> want Sc.PTObject
       JSON.Array _  -> want Sc.PTArray
@@ -107,47 +190,63 @@ validateType value valType =
       JSON.Bool _   -> want Sc.PTBoolean
       JSON.Null     -> want Sc.PTNull
       JSON.Number n -> if Scientific.isInteger n
-        then want Sc.PTInteger <!> want Sc.PTNumber
+        then do
+          a <- want Sc.PTInteger
+          b <- want Sc.PTNumber
+          pure $ a <!> b
         else want Sc.PTNumber
 
   where
-    mkError :: V.Vector Sc.PrimitiveType -> Sc.PrimitiveType -> ValidationErrors
-    mkError typs t =
-      let expected = if V.length typs == 1
-            then "type: " <> Sc.prettyPrimitiveType (V.head typs)
-            else "one of the following type: " <> Tx.intercalate ", " (F.toList $ fmap Sc.prettyPrimitiveType typs)
-       in ValidationErrors ["Expected " <> expected <> " but got " <> Sc.prettyPrimitiveType t]
+    mkError :: V.Vector Sc.PrimitiveType -> Sc.PrimitiveType -> ValM ()
+    mkError typs t = mkValidationError
+      "type"
+      ("should be: " <> Tx.intercalate ", " (V.toList $ fmap Sc.prettyPrimitiveType typs))
+      (JSON.Object $ Map.singleton
+        "allowedTypes"
+        (JSON.Array $ fmap (JSON.String . Sc.prettyPrimitiveType) typs))
 
 
-validateObject :: JSON.Value -> Sc.ObjectValidator -> ValidationOutcome ()
+validateObject :: JSON.Value -> Sc.ObjectValidator -> ValM ()
 validateObject value valObj = case value of
-  JSON.Object o -> F.traverse_ id
-    [ void $ Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
-    , void $ validateAdditionalProps o valObj
-    , void $ validatePatternProps o (Sc.ovPatternProps valObj)
-    ]
-  _ -> pure ()
+  JSON.Object o -> do
+    resultProp <- F.traverse_ id <$> Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
+    resultAdditionalProps <- validateAdditionalProps o valObj
+    resultPatternProps <- validatePatternProps o (Sc.ovPatternProps valObj)
+    pure $ F.traverse_ id [resultProp]
+  _ -> pure $ pure ()
 
   where
-    validateProps props key jsonVal = case Map.lookup key props of
-      Nothing -> pure ()
-      Just schema -> void $ validate (Sc.SubSchema schema) jsonVal
+    validateProps :: Map.HashMap Text Sc.Schema -> Text -> JSON.Value -> ValM ()
+    validateProps props key jsonVal = Rdr.local (addDataPath key . addSchemaPath "properties") $ case Map.lookup key props of
+      Nothing -> pure $ pure ()
+      Just schema -> void <$> validate (Sc.SubSchema schema) jsonVal
 
+    validateAdditionalProps :: JSON.Object -> Sc.ObjectValidator -> ValM ()
     validateAdditionalProps o valObj =
       let additionalKeyVals = getAdditionalKeyValues o valObj
-      in
-      case Sc.ovAdditionalProps valObj of
-        Sc.AllAdditionalProperties -> pure ()
+      in case Sc.ovAdditionalProps valObj of
+        Sc.AllAdditionalProperties -> pure $ Ok ()
         Sc.NoAdditionalProperties -> if null additionalKeyVals
-          then pure ()
-          else Error $ ValidationErrors ["Unexpected keys: " <> Tx.pack (show $ map fst additionalKeyVals)]
-        Sc.SomeAdditionalProperties schema ->
-          F.traverse_ (validate (Sc.SubSchema schema) . snd) additionalKeyVals
+          then pure $ Ok ()
+          else mkValidationError
+            "additionalProperties"
+            "should NOT have additionalProperties"
+            (JSON.Object $ Map.fromList additionalKeyVals)
 
-    validatePatternProps o patternProps = F.traverse_ (validateOnePatternProp o) (OrdMap.toList patternProps)
+        Sc.SomeAdditionalProperties schema -> do
+          result <- traverse
+            (\(k, v) -> Rdr.local (addDataPath k) $ validate (Sc.SubSchema schema) v)
+            additionalKeyVals
+          pure $ F.traverse_ id result
+
+    validatePatternProps o patternProps = Rdr.local (addSchemaPath "patternProperties") $
+      F.traverse_ (validateOnePatternProp o) (OrdMap.toList patternProps)
 
     validateOnePatternProp o (regexp, schema) = void $ Map.traverseWithKey
-      (\k v -> if k =~ regexp then void (validate (Sc.SubSchema schema) v) else pure ())
+      (\k v -> if k =~ regexp
+                 then void (Rdr.local (addDataPath k) $ validate (Sc.SubSchema schema) v)
+                 else pure ()
+      )
       o
 
     -- additionalProperties and patternProperties interaction requires some logic to get all
@@ -161,118 +260,167 @@ validateObject value valObj = case value of
           additionalKeys = filter (\k -> not $ F.any (k =~) allPatterns) (OrdSet.toList allAdditionalKeys)
       in Mb.mapMaybe (\k -> (k,) <$> Map.lookup k obj) additionalKeys
 
-validateBoolean :: Bool -> ValidationOutcome ()
+validateBoolean :: Bool -> ValM ()
 validateBoolean b = if b
-  then pure ()
-  else Error $ ValidationErrors ["Boolean schema is false"]
+  then pure $ Ok ()
+  else mkValidationError "false schema" "boolean schema is false" (JSON.Object mempty)
 
-validateArray :: JSON.Value -> Sc.ArrayValidator -> ValidationOutcome ()
+validateArray :: JSON.Value -> Sc.ArrayValidator -> ValM ()
 validateArray value valA = case value of
-  JSON.Array arr -> F.traverse_ id
-    [ validateMaxItems arr valA
-    , validateMinItems arr valA
-    , validateItems arr valA
-    , validateUnique arr valA
-    , validateContains arr valA
-    ]
-  _ -> pure ()
+  JSON.Array arr -> do
+    resultMaxItems <- runMbValidator (validateMaxItems arr) (Sc.avMaxItems valA)
+    resultMinItems <- runMbValidator (validateMinItems arr) (Sc.avMinItems valA)
+    resultItems <- validateItems arr valA
+    resultUnique <- validateUnique arr (Sc.avUniqueItems valA)
+    resultContains <- runMbValidator (validateContains arr) (Sc.avContainsItem valA)
+
+    pure $ F.traverse_ id
+      [ resultMaxItems
+      , resultMinItems
+      , resultItems
+      , resultUnique
+      , resultContains
+      ]
+  _ -> pure $ Ok ()
 
   where
-    validateMaxItems a v = case Sc.avMaxItems v of
-      Nothing -> Ok ()
-      Just x -> if V.length a <= x
-        then Ok ()
-        else Error $ ValidationErrors
-          [Tx.pack $ "MaxItems is " <> show x <> " but array has " <> show (V.length a)]
+    validateMaxItems a limit = Rdr.local (addSchemaPath "maxItems") $
+      if V.length a <= limit
+        then pure $ Ok ()
+        else mkValidationError
+          "maxItems"
+          ("should NOT have more than " <> Tx.pack (show limit) <> " items")
+          (JSON.Object $ Map.singleton "limit" (mkJSONNum limit))
 
-    validateMinItems a v = case Sc.avMinItems v of
-      Nothing -> Ok ()
-      Just x -> if V.length a >= x
-        then Ok ()
-        else Error $ ValidationErrors
-          [Tx.pack $ "MinItems is " <> show x <> " but array has " <> show (V.length a)]
+    validateMinItems a limit = Rdr.local (addSchemaPath "minItems") $
+      if V.length a >= limit
+        then pure $ Ok ()
+        else mkValidationError
+          "minItems"
+          ("should NOT have less than " <> Tx.pack (show limit) <> " items")
+          (JSON.Object $ Map.singleton "limit" (mkJSONNum limit))
 
-    validateItems a v = case Sc.avItems v of
-      Sc.SingleSchema schema -> F.traverse_ (validate (Sc.SubSchema schema)) a
+    mkJSONNum x = JSON.Number $ Scientific.scientific (fromIntegral x) 0
 
-      Sc.MultipleSchemas schemas -> if V.length a <= V.length schemas
-        then
-          F.traverse_ (\(schema, val) -> validate (Sc.SubSchema schema) val) (V.zip schemas a)
+    iTraverse :: Applicative f => ((Int, a) -> f b) -> V.Vector a -> f (V.Vector b)
+    iTraverse f vec =
+      let idxs = V.iterateN (V.length vec) (+1) 0
+       in traverse f (V.zip idxs vec)
+
+    -- validateItems :: JSON.Array -> Sc.ItemsValidator -> ValM ()
+    validateItems a v = Rdr.local (addSchemaPath "items") $ case Sc.avItems v of
+      Sc.SingleSchema schema -> do
+        results <- iTraverse
+          (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $ validate (Sc.SubSchema schema) val)
+          a
+        pure $ F.traverse_ id results
+
+      Sc.MultipleSchemas schemas -> Rdr.local (addSchemaPath "items") $ if V.length a <= V.length schemas
+        then do
+          results <- iTraverse
+            (\(idx, (schema, val)) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $
+              validate (Sc.SubSchema schema) val)
+            (V.zip schemas a)
+          pure $ F.traverse_ id results
         else
           let remainingItems = V.drop (V.length schemas) a
+              schemasL = V.length schemas
            in case Sc.avAdditionalItems v of
                 Sc.AdditionalAllAllowed
-                  -> pure ()
+                  -> pure $ Ok ()
 
                 Sc.AdditionalAllForbidden
-                  -> Error $ ValidationErrors ["Too many items"]
+                  -> mkValidationError
+                       "additionalItems"
+                       ("should NOT have more than " <> Tx.pack (show schemasL) <> " items")
+                       (JSON.Object $ Map.singleton "limit" (mkJSONNum schemasL))
 
                 Sc.AdditionalSingleSchema schema
-                  -> F.traverse_ (validate (Sc.SubSchema schema)) remainingItems
+                  -> do
+                    results <- iTraverse
+                      (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + V.length schemas)) $
+                        validate (Sc.SubSchema schema) val)
+                      remainingItems
+                    pure $ F.traverse_ id results
+
 
                 Sc.AdditionalMultipleSchemas schemas'
                   -> if V.length remainingItems <= V.length schemas'
-                    then
-                      F.traverse_ (\(s, val) -> validate (Sc.SubSchema s) val) (V.zip schemas' remainingItems)
-                    else
-                      Error $ ValidationErrors ["Too many items"]
+                    then do
+                      results <- iTraverse
+                        (\(idx, (s, val)) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + schemasL)) $
+                          validate (Sc.SubSchema s) val)
+                        (V.zip schemas' remainingItems)
+                      pure $ F.traverse_ id results
+                    else mkValidationError
+                      "additionalItems"
+                      ("should NOT have more than " <> Tx.pack (show schemasL) <> " items")
+                      (JSON.Object $ Map.singleton "limit" (mkJSONNum schemasL))
 
-      Sc.NoItemsValidator -> pure ()
+      Sc.NoItemsValidator -> pure $ Ok ()
 
-    validateUnique a v = case Sc.avUniqueItems v of
-      Sc.ItemsCanBeDuplicated -> pure ()
+    validateUnique a v = Rdr.local (addSchemaPath "uniqueItems") $ case v of
+      Sc.ItemsCanBeDuplicated -> pure $ Ok ()
       Sc.ItemsMustBeUnique -> if length (Set.fromList $ V.toList a) == length a
-        then pure ()
-        else Error $ ValidationErrors ["Items aren't unique"]
+        then pure $ Ok ()
+        else mkValidationError
+          "uniqueItems"
+          "should NOT have duplicate items"
+          (JSON.Object mempty)
 
-    validateContains a v = case Sc.avContainsItem v of
-      Nothing -> pure ()
-      Just schema -> void $ F.asum $ fmap (validate (Sc.SubSchema schema)) a
+    validateContains a schema = Rdr.local (addSchemaPath "contains") $ do
+      results <- mapM (validate (Sc.SubSchema schema)) a
+      pure $ void $ F.asum results
 
-validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValidationOutcome ()
+validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValM ()
 validateNumeric value valN = case value of
-  JSON.Number n -> F.traverse_ id
-    [ validateMultipleOf n (Sc.nvMultipleOf valN)
-    , validateMinimum n (Sc.nvMinimum valN)
-    , validateMaximum n (Sc.nvMaximum valN)
-    , validateExclusiveMinimum n (Sc.nvExclusiveMinimum valN)
-    , validateExclusiveMaximum n (Sc.nvExclusiveMaximum valN)
-    ]
-  _ -> pure ()
+  JSON.Number n -> do
+    resultMultipleOf <- runMbValidator (validateMultipleOf n) (Sc.nvMultipleOf valN)
+    resultMinimum <- runMbValidator (validateMinimum n) (Sc.nvMinimum valN)
+    resultMaximum <- runMbValidator (validateMaximum n) (Sc.nvMaximum valN)
+    resultExclusiveMinimum <- runMbValidator (validateExclusiveMinimum n) (Sc.nvExclusiveMinimum valN)
+    resultExclusiveMaximum <- runMbValidator (validateExclusiveMaximum n) (Sc.nvExclusiveMaximum valN)
+
+    pure $ F.traverse_ id
+      [ resultMultipleOf
+      , resultMinimum
+      , resultMaximum
+      , resultExclusiveMinimum
+      , resultExclusiveMaximum
+      ]
+  _ -> pure $ Ok ()
 
   where
-    validateMultipleOf n = \case
-      Nothing -> pure ()
-      Just x ->
-        let (coeffN, baseN) = (Scientific.coefficient n, Scientific.base10Exponent n)
-            (coeffX, baseX) = (Scientific.coefficient x, Scientific.base10Exponent x)
-         in if baseN == baseX
-              then assert "multipleOf" (coeffN `mod` coeffX == 0)
-              else
-                let diff = abs (baseN - baseX)
-                    (cn', cx') = if baseN > baseX
-                      then (coeffN * 10 ^ diff, coeffX)
-                      else (coeffN, coeffX * 10 ^ diff)
-                 in assert "multipleOf" (cn' `mod` cx' == 0)
+    validateMultipleOf :: Scientific.Scientific -> Scientific.Scientific -> ValM ()
+    validateMultipleOf n x = Rdr.local (addSchemaPath "multipleOf") $
+      let (coeffN, baseN) = (Scientific.coefficient n, Scientific.base10Exponent n)
+          (coeffX, baseX) = (Scientific.coefficient x, Scientific.base10Exponent x)
+          assertMult b = if b
+            then pure $ Ok ()
+            else mkValidationError
+              "multipleOf"
+              (Tx.pack (show n) <> " is not a multiple of " <> Tx.pack (show x))
+              (JSON.Number n)
 
-    validateMinimum n = maybe (pure ()) (\x -> assert "minimum" (n >= x))
-    validateMaximum n = maybe (pure ()) (\x -> assert "maximum" (n <= x))
-    validateExclusiveMinimum n = maybe (pure ()) (\x -> assert "exclusiveMinimum" (x < n))
-    validateExclusiveMaximum n = maybe (pure ()) (\x -> assert "exclusiveMaximum" (x > n))
-
-    assert :: Text -> Bool -> ValidationOutcome ()
-    assert keyword = \case
-      True -> Ok ()
-      False -> Error $ ValidationErrors [keyword <> " failed"]
-
-    -- whenJust f = \case
-    --   Nothing -> pure ()
-    --   Just x -> f 
+       in if baseN == baseX
+            then assertMult (coeffN `mod` coeffX == 0)
+            else
+              let diff = abs (baseN - baseX)
+                  (cn', cx') = if baseN > baseX
+                    then (coeffN * 10 ^ diff, coeffX)
+                    else (coeffN, coeffX * 10 ^ diff)
+               in assertMult (cn' `mod` cx' == 0)
 
 
-  -- { nvMultipleOf       :: Maybe Scientific
-  -- , nvMinimum          :: Maybe Scientific
-  -- , nvMaximum          :: Maybe Scientific
-  -- , nvExclusiveMinimum :: Maybe Scientific
-  -- , nvExclusiveMaximum :: Maybe Scientific
-  -- }
+    assert pred keyword msg n limit = Rdr.local (addSchemaPath keyword) $
+      if pred n limit
+        then pure $ Ok ()
+        else mkValidationError
+          keyword
+          (Tx.pack (show n) <> " " <> msg <> " " <> Tx.pack (show limit))
+          (JSON.Number n)
+
+    validateMinimum = assert (>=) "minimum" "must be greater than"
+    validateMaximum = assert (<=) "maximum" "must be less than"
+    validateExclusiveMinimum = assert (>) "exclusiveMinimum" "must be strictly greater than"
+    validateExclusiveMaximum = assert (<) "exclusiveMaximum" "must be strictly less than"

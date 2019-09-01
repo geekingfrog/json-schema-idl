@@ -4,6 +4,7 @@
 
 module Data.JSON.Schema.UnitTests where
 
+import qualified Data.Text as Tx
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Aeson           as JSON
 import qualified Data.Aeson.QQ.Simple as JSON
@@ -108,14 +109,34 @@ tests = T.testGroup "unit tests"
 
 randomTest :: T.TestTree
 randomTest = T.H.testCaseSteps "boom" $ \step -> do
-  let val = [JSON.aesonQQ|0|]
-  let (Right schema) = JSON.parseEither JSON.parseJSON [JSON.aesonQQ|
-      { "const": null }
+  let val = [JSON.aesonQQ|{"fxo": []}|]
+  let rawSchema = [JSON.aesonQQ|
+      {
+          "properties": {
+              "foo": {"type": "array", "maxItems": 3},
+              "bar": {"type": "array"}
+          },
+          "patternProperties": {"f.o": {"minItems": 2}},
+          "additionalProperties": {"type": "integer"}
+      }
     |]
-  let result = Val.validate schema val
-  step ("parsed schema: " <> show schema)
+
+  case parseSchema rawSchema of
+    Left err -> do
+      step err
+      T.H.assertFailure "schema failed to parse"
+    Right schema -> do
+      step $ "parsed schema: " <> show schema
+      let result = Val.runValidation (Val.validate schema val) Val.emptyValidationEnv
+      step $ Tx.unpack $ "result of validation: " <> Val.prettyValidationOutcome result
+      case result of
+        Val.Error e -> step $ "number of errors: " <> show (length e)
+        _ -> pure ()
+      pure ()
+
+  -- let result = Val.validate schema val
+  -- step ("parsed schema: " <> show schema)
   -- T.H.assertEqual "nope" (Val.Ok val) result
-  pure ()
 
 parseSchema :: JSON.Value -> Either String Sc.JSONSchema
 parseSchema = JSON.parseEither JSON.parseJSON

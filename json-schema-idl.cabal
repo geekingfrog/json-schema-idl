@@ -27,6 +27,8 @@ library
                      , semigroupoids
                      , containers
                      , pcre-heavy
+                     , mtl
+                     , aeson-pretty
 
   ghc-options:         -fwarn-incomplete-patterns -Werror
   exposed-modules:     Data.JSON.Schema
@@ -46,6 +48,7 @@ test-suite test
                      , containers
                      , unordered-containers
                      , pcre-heavy
+                     , mtl
 
   other-modules:       Data.JSON.Schema.TestSuite
                      , Data.JSON.Schema.UnitTests
