@@ -98,6 +98,8 @@ data Validator
   | ValBool Bool
   | ValArray ArrayValidator
   | ValNumeric NumericValidator
+  | ValString StringValidator
+  | ValLogic LogicValidator
   deriving (Eq, Show)
 
 parseAllValidators :: JSON.Object -> JSON.Parser (V.Vector Validator)
@@ -107,6 +109,8 @@ parseAllValidators o = do
     , fmap ValObject <$> parseObjectValidator o
     , fmap ValArray <$> parseArrayValidator o
     , fmap ValNumeric <$> parseNumericValidator o
+    , fmap ValString <$> parseStringValidator o
+    , fmap ValLogic <$> parseLogicValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
@@ -169,8 +173,9 @@ data ObjectValidator = ObjectValidator
   , ovAdditionalProps :: AdditionalProperties
   , ovPatternProps    :: OrdMap.Map RE.Regex Schema
   , ovRequired        :: RequiredProperties
-  , ovMinProps        :: Maybe Int
-  , ovMaxProps        :: Maybe Int
+  , ovMinProps        :: Maybe (Positive Int)
+  , ovMaxProps        :: Maybe (Positive Int)
+  , ovPropertyNames   :: Maybe Schema
   }
   deriving (Eq, Show)
 
@@ -206,14 +211,17 @@ parseObjectValidator o = do
   ovAdditionalProps <- parseAdditionalProperties o
   ovPatternProps <- parsePatternProperties o
   ovRequired <- o .:? "required" .!= RequiredProperties mempty
-  ovMinProps <- fmap getPositive <$> o .:? "minProperties"
-  ovMaxProps <- fmap getPositive <$> o .:? "maxProperties"
+  ovMinProps <- o .:? "minProperties"
+  ovMaxProps <- o .:? "maxProperties"
+  ovPropertyNames <- o .:? "propertyNames"
+
   if ovAdditionalProps == AllAdditionalProperties
        && Map.null ovProperties
        && OrdMap.null ovPatternProps
        && V.null (getRequiredProperties ovRequired)
        && Mb.isNothing ovMinProps
        && Mb.isNothing ovMaxProps
+       && Mb.isNothing ovPropertyNames
     then pure Nothing
     else pure $ Just $ ObjectValidator{..}
 
@@ -321,3 +329,59 @@ parseNumericValidator o = do
   case nvMultipleOf <|> nvMinimum <|> nvMaximum <|> nvExclusiveMinimum <|> nvExclusiveMaximum of
     Nothing -> pure Nothing
     Just _ -> pure $ Just NumericValidator{..}
+
+data StringValidator = StringValidator
+  { svMinLength :: Maybe (Positive Int)
+  , svMaxLength :: Maybe (Positive Int)
+  , svPattern   :: Maybe Pattern
+  }
+  deriving (Eq, Show)
+
+data Pattern = Pattern
+  { patRe :: RE.Regex
+  , patRaw :: Text
+  }
+  deriving (Eq, Show)
+
+instance JSON.FromJSON Pattern where
+  parseJSON = JSON.withText "pattern" $ \str ->
+    case RE.compileM (encodeUtf8 str) [] of
+      Left err -> fail err
+      Right r -> pure (Pattern r str)
+
+parseStringValidator :: JSON.Object -> JSON.Parser (Maybe StringValidator)
+parseStringValidator o = do
+  svMinLength <- o .:? "minLength"
+  svMaxLength <- o .:? "maxLength"
+  svPattern <- o .:? "pattern"
+  if Mb.isNothing svMinLength && Mb.isNothing svMaxLength && Mb.isNothing svPattern
+    then pure Nothing
+    else pure $ Just StringValidator{..}
+
+data LogicValidator = LogicValidator
+  { lvNot :: Maybe Schema
+  , lvAllOf :: V.Vector Schema
+  , lvAnyOf :: V.Vector Schema
+  , lvOneOf :: V.Vector Schema
+  }
+  deriving (Eq, Show)
+
+parseLogicValidator :: JSON.Object -> JSON.Parser (Maybe LogicValidator)
+parseLogicValidator o = do
+  lvNot <- o .:? "not"
+  lvAllOf <- nonEmpty "allOf" o
+  lvAnyOf <- nonEmpty "anyOf" o
+  lvOneOf <- nonEmpty "oneOf" o
+  if Mb.isNothing lvNot && V.null lvAllOf && V.null lvAnyOf && V.null lvOneOf
+    then pure Nothing
+    else pure $ Just LogicValidator{..}
+
+  where
+    nonEmpty key o = do
+      mbVec <- o .:? key
+      case mbVec of
+        Nothing -> pure mempty
+        Just vec ->
+          if V.null vec
+            then fail $ Tx.unpack key <> " is empty"
+            else pure vec

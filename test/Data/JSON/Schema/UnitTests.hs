@@ -109,16 +109,18 @@ tests = T.testGroup "unit tests"
 
 randomTest :: T.TestTree
 randomTest = T.H.testCaseSteps "boom" $ \step -> do
-  let val = [JSON.aesonQQ|{"fxo": []}|]
+  let val = [JSON.aesonQQ|1|]
   let rawSchema = [JSON.aesonQQ|
-      {
-          "properties": {
-              "foo": {"type": "array", "maxItems": 3},
-              "bar": {"type": "array"}
-          },
-          "patternProperties": {"f.o": {"minItems": 2}},
-          "additionalProperties": {"type": "integer"}
-      }
+    {
+            "oneOf": [
+                {
+                    "type": "integer"
+                },
+                {
+                    "minimum": 2
+                }
+            ]
+    }
     |]
 
   case parseSchema rawSchema of

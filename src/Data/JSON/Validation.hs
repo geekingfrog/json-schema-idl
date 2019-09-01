@@ -1,20 +1,20 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveAnyClass             #-}
+{-# LANGUAGE DeriveFunctor              #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DerivingVia                #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE DeriveFunctor       #-}
-{-# LANGUAGE DerivingVia         #-}
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StrictData          #-}
-{-# LANGUAGE TupleSections       #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StrictData                 #-}
+{-# LANGUAGE TupleSections              #-}
 
 module Data.JSON.Validation where
 
 import Debug.Trace
 
+import Control.Monad
 import GHC.Generics
 import qualified Data.Maybe as Mb
 import           Text.Regex.PCRE.Heavy ((=~))
@@ -100,13 +100,17 @@ data ValidationError = ValidationError
   deriving (Eq, Show, Generic, JSON.ToJSON)
 
 mkValidationError :: Text -> Text -> JSON.Value -> ValM a
-mkValidationError keyword msg params = Rdr.ask >>= \env -> pure $ Error [ValidationError
-  { verrKeyword    = keyword
-  , verrMessage    = msg
-  , verrParams     = params
-  , verrDataPath   = veDataPath env
-  , verrSchemaPath = veSchemaPath env
-  }]
+mkValidationError keyword msg params = (\e -> Error [e]) <$> mkValidationError' keyword msg params
+
+mkValidationError' keyword msg params = Rdr.ask >>= \env -> pure
+  ValidationError
+    { verrKeyword    = keyword
+    , verrMessage    = msg
+    , verrParams     = params
+    , verrDataPath   = veDataPath env
+    , verrSchemaPath = veSchemaPath env
+    }
+
 
 data ValidationEnv = ValidationEnv
   { veDataPath :: [Text]
@@ -144,6 +148,8 @@ validate' value = \case
   Sc.ValBool b -> validateBoolean b
   Sc.ValArray valA -> validateArray value valA
   Sc.ValNumeric valN -> validateNumeric value valN
+  Sc.ValString valStr -> validateString value valStr
+  Sc.ValLogic valLogic -> validateLogic value valLogic
 
 
 validateAny :: JSON.Value -> Sc.AnyValidator -> ValM ()
@@ -152,7 +158,7 @@ validateAny value valAny = do
   resultConst <- runMbValidator (validateConst value) (Sc.anyConst valAny)
   resultEnum <- validateEnum value (Sc.anyEnum valAny)
 
-  pure $ F.traverse_ id
+  pure $ F.sequenceA_
     [ resultType
     , resultConst
     , resultEnum
@@ -209,20 +215,22 @@ validateType value valType = Rdr.local (addSchemaPath "type") $
 validateObject :: JSON.Value -> Sc.ObjectValidator -> ValM ()
 validateObject value valObj = case value of
   JSON.Object o -> do
-    resultProp <- F.traverse_ id <$> Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
+    resultProp <- F.sequenceA_ <$> Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
     resultAdditionalProps <- validateAdditionalProps o valObj
     resultPatternProps <- validatePatternProps o (Sc.ovPatternProps valObj)
     resultRequired <- validateRequired o (Sc.ovRequired valObj)
     resultMinProps <- runMbValidator (validateMinProps o) (Sc.ovMinProps valObj)
     resultMaxProps <- runMbValidator (validateMaxProps o) (Sc.ovMaxProps valObj)
+    resultPropertyNames <- runMbValidator (validatePropertyNames o) (Sc.ovPropertyNames valObj)
 
-    pure $ F.traverse_ id
+    pure $ F.sequenceA_
       [ resultProp
       , resultAdditionalProps
       , resultPatternProps
       , resultRequired
       , resultMinProps
       , resultMaxProps
+      , resultPropertyNames
       ]
   _ -> pure $ pure ()
 
@@ -248,7 +256,7 @@ validateObject value valObj = case value of
           result <- traverse
             (\(k, v) -> Rdr.local (addDataPath k) $ validate (Sc.SubSchema schema) v)
             additionalKeyVals
-          pure $ F.traverse_ id result
+          pure $ F.sequenceA_ result
 
     validatePatternProps o patternProps = Rdr.local (addSchemaPath "patternProperties") $ do
       results <- traverse (validateOnePatternProp o) (OrdMap.toList patternProps)
@@ -280,7 +288,7 @@ validateObject value valObj = case value of
           ("should have required properties " <> Tx.intercalate ", " (V.toList req))
           (JSON.Object $ Map.singleton "requiredProperties" (JSON.Array $ fmap JSON.String req))
 
-    validateNum pred keyword msg o limit = Rdr.local (addSchemaPath keyword) $
+    validateNum pred keyword msg o (Sc.Positive limit) = Rdr.local (addSchemaPath keyword) $
       if pred (length $ Map.keys o) limit
         then pure $ Ok ()
         else mkValidationError
@@ -290,6 +298,20 @@ validateObject value valObj = case value of
 
     validateMinProps = validateNum (>=) "minProperties" "should NOT have fewer than"
     validateMaxProps = validateNum (<=) "maxProperties" "should NOT have less than"
+
+    validatePropertyNames o schema = Rdr.local (addSchemaPath "propertyNames") $ do
+      results <- forM (Map.keys o) $ \k -> do
+        res <- validate (Sc.SubSchema schema) (JSON.String k)
+        case res of
+          Ok _ -> pure $ Ok ()
+          Error errs -> do
+            nameError <- mkValidationError'
+              "propertyNames"
+              ("property name " <> k <> " is invalid")
+              (JSON.Object $ Map.singleton "propertyNames" (JSON.String k))
+            pure $ Error (nameError : errs)
+
+      pure $ F.sequenceA_ results
 
 
 validateBoolean :: Bool -> ValM ()
@@ -306,7 +328,7 @@ validateArray value valA = case value of
     resultUnique <- validateUnique arr (Sc.avUniqueItems valA)
     resultContains <- runMbValidator (validateContains arr) (Sc.avContainsItem valA)
 
-    pure $ F.traverse_ id
+    pure $ F.sequenceA_
       [ resultMaxItems
       , resultMinItems
       , resultItems
@@ -343,7 +365,7 @@ validateArray value valA = case value of
         results <- iTraverse
           (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $ validate (Sc.SubSchema schema) val)
           a
-        pure $ F.traverse_ id results
+        pure $ F.sequenceA_ results
 
       Sc.MultipleSchemas schemas -> Rdr.local (addSchemaPath "items") $ if V.length a <= V.length schemas
         then do
@@ -351,7 +373,7 @@ validateArray value valA = case value of
             (\(idx, (schema, val)) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $
               validate (Sc.SubSchema schema) val)
             (V.zip schemas a)
-          pure $ F.traverse_ id results
+          pure $ F.sequenceA_ results
         else
           let remainingItems = V.drop (V.length schemas) a
               schemasL = V.length schemas
@@ -371,7 +393,7 @@ validateArray value valA = case value of
                       (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + V.length schemas)) $
                         validate (Sc.SubSchema schema) val)
                       remainingItems
-                    pure $ F.traverse_ id results
+                    pure $ F.sequenceA_ results
 
 
                 Sc.AdditionalMultipleSchemas schemas'
@@ -381,7 +403,7 @@ validateArray value valA = case value of
                         (\(idx, (s, val)) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + schemasL)) $
                           validate (Sc.SubSchema s) val)
                         (V.zip schemas' remainingItems)
-                      pure $ F.traverse_ id results
+                      pure $ F.sequenceA_ results
                     else mkValidationError
                       "additionalItems"
                       ("should NOT have more than " <> Tx.pack (show schemasL) <> " items")
@@ -411,7 +433,7 @@ validateNumeric value valN = case value of
     resultExclusiveMinimum <- runMbValidator (validateExclusiveMinimum n) (Sc.nvExclusiveMinimum valN)
     resultExclusiveMaximum <- runMbValidator (validateExclusiveMaximum n) (Sc.nvExclusiveMaximum valN)
 
-    pure $ F.traverse_ id
+    pure $ F.sequenceA_
       [ resultMultipleOf
       , resultMinimum
       , resultMaximum
@@ -454,6 +476,91 @@ validateNumeric value valN = case value of
     validateMaximum = assert (<=) "maximum" "must be less than"
     validateExclusiveMinimum = assert (>) "exclusiveMinimum" "must be strictly greater than"
     validateExclusiveMaximum = assert (<) "exclusiveMaximum" "must be strictly less than"
+
+validateString :: JSON.Value -> Sc.StringValidator -> ValM ()
+validateString value valStr = case value of
+  JSON.String str -> do
+    resultMinLength <- runMbValidator (validateMinLength str) (Sc.svMinLength valStr)
+    resultMaxLength <- runMbValidator (validateMaxLength str) (Sc.svMaxLength valStr)
+    resultPattern <- runMbValidator (validatePattern str) (Sc.svPattern valStr)
+
+    pure $ F.sequenceA_
+      [ resultMinLength
+      , resultMaxLength
+      , resultPattern
+      ]
+  _ -> pure $ Ok ()
+
+  where
+    validateNumeric pred keyword msg s (Sc.Positive limit) = Rdr.local (addSchemaPath keyword) $
+      if pred (Tx.length s) limit
+        then pure $ Ok ()
+        else mkValidationError
+          keyword
+          (msg <> " " <> Tx.pack (show limit) <> " characters")
+          (JSON.Object $ Map.singleton "limit" (mkJSONNum limit))
+
+    validateMinLength = validateNumeric (>=) "minLength" "should NOT be shorter than"
+    validateMaxLength = validateNumeric (<=) "minLength" "should NOT be longer than"
+
+    validatePattern str (Sc.Pattern pat rawPattern) = Rdr.local (addSchemaPath "pattern") $
+      if str =~ pat
+        then pure $ Ok ()
+        else mkValidationError
+          "pattern"
+          ("should match pattern " <> rawPattern)
+          (JSON.Object $ Map.singleton "pattern" (JSON.String rawPattern))
+
+
+validateLogic :: JSON.Value -> Sc.LogicValidator -> ValM ()
+validateLogic value valLogic = do
+  resultNot <- runMbValidator (validateNot value) (Sc.lvNot valLogic)
+  resultAllOf <- runWhenNonEmpty (validateAllOf value) (Sc.lvAllOf valLogic)
+  resultAnyOf <- runWhenNonEmpty (validateAnyOf value) (Sc.lvAnyOf valLogic)
+  resultOneOf <- runWhenNonEmpty (validateOneOf value) (Sc.lvOneOf valLogic)
+
+  pure $ F.sequenceA_
+    [ resultNot
+    , resultAllOf
+    , resultAnyOf
+    , resultOneOf
+    ]
+
+  where
+    validateNot val schema = Rdr.local (addSchemaPath "not") $
+      validate (Sc.SubSchema schema) val >>= \case
+        Error _ -> pure $ Ok ()
+        Ok _ -> mkValidationError
+          "not"
+          "should NOT be valid"
+          (JSON.Object mempty)
+
+    validateAllOf val schemas = Rdr.local (addSchemaPath "allOf") $ do
+      results <- traverse (\s -> validate (Sc.SubSchema s) val) schemas
+      pure $ F.sequenceA_ results
+
+    validateAnyOf val schemas = Rdr.local (addSchemaPath "anyOf") $ do
+      results <- mapM (\s -> validate (Sc.SubSchema s) val) schemas
+      pure $ void $ F.asum results
+
+    validateOneOf val schemas = Rdr.local (addSchemaPath "oneOf") $ do
+      results <- mapM (\s -> validate (Sc.SubSchema s) val) schemas
+      let withIdx = V.zip (V.iterateN (V.length results) (+1) 0) results
+      let passingWithIdx = V.filter (isOk . snd) withIdx
+      if length passingWithIdx == 1
+        then pure $ Ok ()
+        else mkValidationError
+          "oneOf"
+          "should match exactly one schema in oneOf"
+          (JSON.Object $ Map.singleton "passingSchemas" $ JSON.Array (fmap (mkJSONNum . fst) passingWithIdx))
+
+    runWhenNonEmpty f a = if V.null a
+      then pure $ Ok ()
+      else f a
+
+    isOk = \case
+      Ok{} -> True
+      Error{} -> False
 
 
 mkJSONNum :: Int -> JSON.Value
