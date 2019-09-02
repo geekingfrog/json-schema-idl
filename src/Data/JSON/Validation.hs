@@ -153,16 +153,11 @@ validate' value = \case
 
 
 validateAny :: JSON.Value -> Sc.AnyValidator -> ValM ()
-validateAny value valAny = do
-  resultType <- runMbValidator (validateType value) (Sc.anyType valAny)
-  resultConst <- runMbValidator (validateConst value) (Sc.anyConst valAny)
-  resultEnum <- validateEnum value (Sc.anyEnum valAny)
-
-  pure $ F.sequenceA_
-    [ resultType
-    , resultConst
-    , resultEnum
-    ]
+validateAny value valAny = F.sequenceA_ <$> sequence
+  [ runMbValidator (validateType value) (Sc.anyType valAny)
+  , runMbValidator (validateConst value) (Sc.anyConst valAny)
+  , validateEnum value (Sc.anyEnum valAny)
+  ]
 
   where
     validateConst val constVal = Rdr.local (addSchemaPath "const") $
@@ -214,24 +209,16 @@ validateType value valType = Rdr.local (addSchemaPath "type") $
 
 validateObject :: JSON.Value -> Sc.ObjectValidator -> ValM ()
 validateObject value valObj = case value of
-  JSON.Object o -> do
-    resultProp <- F.sequenceA_ <$> Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
-    resultAdditionalProps <- validateAdditionalProps o valObj
-    resultPatternProps <- validatePatternProps o (Sc.ovPatternProps valObj)
-    resultRequired <- validateRequired o (Sc.ovRequired valObj)
-    resultMinProps <- runMbValidator (validateMinProps o) (Sc.ovMinProps valObj)
-    resultMaxProps <- runMbValidator (validateMaxProps o) (Sc.ovMaxProps valObj)
-    resultPropertyNames <- runMbValidator (validatePropertyNames o) (Sc.ovPropertyNames valObj)
+  JSON.Object o -> F.sequenceA_ <$> sequence
+    [ F.sequenceA_ <$> Map.traverseWithKey (validateProps (Sc.ovProperties valObj)) o
+    , validateAdditionalProps o valObj
+    , validatePatternProps o (Sc.ovPatternProps valObj)
+    , validateRequired o (Sc.ovRequired valObj)
+    , runMbValidator (validateMinProps o) (Sc.ovMinProps valObj)
+    , runMbValidator (validateMaxProps o) (Sc.ovMaxProps valObj)
+    , runMbValidator (validatePropertyNames o) (Sc.ovPropertyNames valObj)
+    ]
 
-    pure $ F.sequenceA_
-      [ resultProp
-      , resultAdditionalProps
-      , resultPatternProps
-      , resultRequired
-      , resultMinProps
-      , resultMaxProps
-      , resultPropertyNames
-      ]
   _ -> pure $ pure ()
 
   where
@@ -321,20 +308,14 @@ validateBoolean b = if b
 
 validateArray :: JSON.Value -> Sc.ArrayValidator -> ValM ()
 validateArray value valA = case value of
-  JSON.Array arr -> do
-    resultMaxItems <- runMbValidator (validateMaxItems arr) (Sc.avMaxItems valA)
-    resultMinItems <- runMbValidator (validateMinItems arr) (Sc.avMinItems valA)
-    resultItems <- validateItems arr valA
-    resultUnique <- validateUnique arr (Sc.avUniqueItems valA)
-    resultContains <- runMbValidator (validateContains arr) (Sc.avContainsItem valA)
+  JSON.Array arr -> F.sequenceA_ <$> sequence
+    [ runMbValidator (validateMaxItems arr) (Sc.avMaxItems valA)
+    , runMbValidator (validateMinItems arr) (Sc.avMinItems valA)
+    , validateItems arr valA
+    , validateUnique arr (Sc.avUniqueItems valA)
+    , runMbValidator (validateContains arr) (Sc.avContainsItem valA)
+    ]
 
-    pure $ F.sequenceA_
-      [ resultMaxItems
-      , resultMinItems
-      , resultItems
-      , resultUnique
-      , resultContains
-      ]
   _ -> pure $ Ok ()
 
   where
@@ -426,20 +407,14 @@ validateArray value valA = case value of
 
 validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValM ()
 validateNumeric value valN = case value of
-  JSON.Number n -> do
-    resultMultipleOf <- runMbValidator (validateMultipleOf n) (Sc.nvMultipleOf valN)
-    resultMinimum <- runMbValidator (validateMinimum n) (Sc.nvMinimum valN)
-    resultMaximum <- runMbValidator (validateMaximum n) (Sc.nvMaximum valN)
-    resultExclusiveMinimum <- runMbValidator (validateExclusiveMinimum n) (Sc.nvExclusiveMinimum valN)
-    resultExclusiveMaximum <- runMbValidator (validateExclusiveMaximum n) (Sc.nvExclusiveMaximum valN)
+  JSON.Number n -> F.sequenceA_ <$> sequence
+    [ runMbValidator (validateMultipleOf n) (Sc.nvMultipleOf valN)
+    , runMbValidator (validateMinimum n) (Sc.nvMinimum valN)
+    , runMbValidator (validateMaximum n) (Sc.nvMaximum valN)
+    , runMbValidator (validateExclusiveMinimum n) (Sc.nvExclusiveMinimum valN)
+    , runMbValidator (validateExclusiveMaximum n) (Sc.nvExclusiveMaximum valN)
+    ]
 
-    pure $ F.sequenceA_
-      [ resultMultipleOf
-      , resultMinimum
-      , resultMaximum
-      , resultExclusiveMinimum
-      , resultExclusiveMaximum
-      ]
   _ -> pure $ Ok ()
 
   where
@@ -479,16 +454,12 @@ validateNumeric value valN = case value of
 
 validateString :: JSON.Value -> Sc.StringValidator -> ValM ()
 validateString value valStr = case value of
-  JSON.String str -> do
-    resultMinLength <- runMbValidator (validateMinLength str) (Sc.svMinLength valStr)
-    resultMaxLength <- runMbValidator (validateMaxLength str) (Sc.svMaxLength valStr)
-    resultPattern <- runMbValidator (validatePattern str) (Sc.svPattern valStr)
+  JSON.String str -> F.sequenceA_ <$> sequence
+    [ runMbValidator (validateMinLength str) (Sc.svMinLength valStr)
+    , runMbValidator (validateMaxLength str) (Sc.svMaxLength valStr)
+    , runMbValidator (validatePattern str) (Sc.svPattern valStr)
+    ]
 
-    pure $ F.sequenceA_
-      [ resultMinLength
-      , resultMaxLength
-      , resultPattern
-      ]
   _ -> pure $ Ok ()
 
   where
@@ -513,18 +484,12 @@ validateString value valStr = case value of
 
 
 validateLogic :: JSON.Value -> Sc.LogicValidator -> ValM ()
-validateLogic value valLogic = do
-  resultNot <- runMbValidator (validateNot value) (Sc.lvNot valLogic)
-  resultAllOf <- runWhenNonEmpty (validateAllOf value) (Sc.lvAllOf valLogic)
-  resultAnyOf <- runWhenNonEmpty (validateAnyOf value) (Sc.lvAnyOf valLogic)
-  resultOneOf <- runWhenNonEmpty (validateOneOf value) (Sc.lvOneOf valLogic)
-
-  pure $ F.sequenceA_
-    [ resultNot
-    , resultAllOf
-    , resultAnyOf
-    , resultOneOf
-    ]
+validateLogic value valLogic = F.sequenceA_ <$> sequence
+  [ runMbValidator (validateNot value) (Sc.lvNot valLogic)
+  , runWhenNonEmpty (validateAllOf value) (Sc.lvAllOf valLogic)
+  , runWhenNonEmpty (validateAnyOf value) (Sc.lvAnyOf valLogic)
+  , runWhenNonEmpty (validateOneOf value) (Sc.lvOneOf valLogic)
+  ]
 
   where
     validateNot val schema = Rdr.local (addSchemaPath "not") $
