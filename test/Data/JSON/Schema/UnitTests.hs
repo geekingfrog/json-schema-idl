@@ -1,27 +1,30 @@
+{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE QuasiQuotes       #-}
 
 module Data.JSON.Schema.UnitTests where
 
-import qualified Data.Text as Tx
-import qualified Data.HashMap.Strict as Map
 import qualified Data.Aeson           as JSON
 import qualified Data.Aeson.QQ.Simple as JSON
 import qualified Data.Aeson.Types     as JSON
+import qualified Data.HashMap.Strict  as Map
+import qualified Data.Map.Strict      as OrdMap
+import qualified Data.Set             as Set
+import qualified Data.Text            as Tx
 import qualified Data.Vector          as V
+import           GHC.Stack            (HasCallStack)
 import qualified Test.Tasty           as T
 import           Test.Tasty.HUnit     ((@=?))
 import qualified Test.Tasty.HUnit     as T.H
-import qualified Data.Set as Set
-import GHC.Stack (HasCallStack)
 
 import qualified Data.JSON.Schema     as Sc
 import qualified Data.JSON.Validation as Val
 
 tests :: T.TestTree
 tests = T.testGroup "unit tests"
-  [ randomTest ]
+  [ randomTest
+  , aggregateReferences
+  ]
 
 
 -- parsingTests :: T.TestTree
@@ -106,21 +109,37 @@ tests = T.testGroup "unit tests"
 --
 --   ]
 
+aggregateReferences :: T.TestTree
+aggregateReferences = T.H.testCase "aggregateReferences" $ do
+  schema <- JSON.eitherDecodeFileStrict' "./test/def.json" >>= \case
+    Left err -> T.H.assertFailure err
+    Right s -> pure s
+  let refs = Sc.aggregateReferences schema
+  let expected = Set.fromList
+        [ "http://example.com/other.json"
+        , "http://example.com/other.json#/definitions/X"
+        , "http://example.com/other.json#/definitions/Y"
+        , "http://example.com/other.json#bar"
+        , "http://example.com/root.json"
+        , "http://example.com/root.json#/definitions/A"
+        , "http://example.com/root.json#/definitions/B"
+        , "http://example.com/root.json#/definitions/B/definitions/X"
+        , "http://example.com/root.json#/definitions/B/definitions/Y"
+        , "http://example.com/root.json#/definitions/C"
+        , "http://example.com/root.json#foo"
+        , "http://example.com/t/inner.json"
+        , "urn:uuid:ee564b8a-7a87-4125-8c96-e9f123d6766f"
+        ]
+  Set.fromList (show . Sc.getURI <$> OrdMap.keys refs) @=? expected
+
 
 randomTest :: T.TestTree
 randomTest = T.H.testCaseSteps "boom" $ \step -> do
   let val = [JSON.aesonQQ|1|]
   let rawSchema = [JSON.aesonQQ|
-    {
-            "oneOf": [
-                {
-                    "type": "integer"
-                },
-                {
-                    "minimum": 2
-                }
-            ]
-    }
+        {
+            "items": false
+        }
     |]
 
   case parseSchema rawSchema of
@@ -129,7 +148,7 @@ randomTest = T.H.testCaseSteps "boom" $ \step -> do
       T.H.assertFailure "schema failed to parse"
     Right schema -> do
       step $ "parsed schema: " <> show schema
-      let result = Val.runValidation (Val.validate schema val) Val.emptyValidationEnv
+      let result = Val.validateSchema schema val
       step $ Tx.unpack $ "result of validation: " <> Val.prettyValidationOutcome result
       case result of
         Val.Error e -> step $ "number of errors: " <> show (length e)

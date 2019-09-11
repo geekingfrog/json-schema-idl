@@ -12,33 +12,33 @@
 
 module Data.JSON.Validation where
 
-import Debug.Trace
+import           Debug.Trace
 
-import Control.Monad
-import GHC.Generics
-import qualified Data.Maybe as Mb
-import           Text.Regex.PCRE.Heavy ((=~))
-import qualified Data.Aeson          as JSON
-import qualified Data.Aeson.Text     as JSON.Tx
-import qualified Data.Foldable       as F
-import           Data.Functor        (void, ($>))
+import           Control.Applicative
+import           Control.Monad
+import qualified Control.Monad.Reader  as Rdr
+import qualified Data.Aeson            as JSON
+import qualified Data.Aeson.Text       as JSON.Tx
+import qualified Data.ByteString.Lazy  as LBS
+import qualified Data.Foldable         as F
+import           Data.Functor          (void, ($>))
 import           Data.Functor.Alt
-import qualified Data.HashMap.Strict as Map
-import qualified Data.Map.Strict     as OrdMap
-import qualified Data.Scientific     as Scientific
-import qualified Data.Set            as OrdSet
-import qualified Data.HashSet        as Set
-import           Data.Text           (Text)
-import qualified Data.ByteString.Lazy as LBS
-import qualified Data.Text           as Tx
-import qualified Data.Text.Lazy      as LTx
-import qualified Data.Traversable    as T
-import qualified Data.Typeable       as Typeable
-import qualified Data.Vector         as V
-import Control.Applicative
-import qualified Control.Monad.Reader as Rdr
+import qualified Data.HashMap.Strict   as Map
+import qualified Data.HashSet          as Set
+import qualified Data.Map.Strict       as OrdMap
+import qualified Data.Maybe            as Mb
+import qualified Data.Scientific       as Scientific
+import qualified Data.Set              as OrdSet
+import           Data.Text             (Text)
+import qualified Data.Text             as Tx
+import qualified Data.Text.Lazy        as LTx
+import qualified Data.Traversable      as T
+import qualified Data.Typeable         as Typeable
+import qualified Data.Vector           as V
+import           GHC.Generics
+import           Text.Regex.PCRE.Heavy ((=~))
 
-import qualified Data.JSON.Schema    as Sc
+import qualified Data.JSON.Schema      as Sc
 
 -- Data.Validation on hackage requires lens oÔ so let's roll our own simple version
 data ValidationOutcome a
@@ -133,24 +133,30 @@ type ValM a = ValidationM (ValidationOutcome a)
 runValidation :: ValidationM a -> ValidationEnv -> a
 runValidation m = Rdr.runReader (runValidationM m)
 
-runMbValidator :: (a -> ValM ()) -> Maybe a -> ValM ()
-runMbValidator = maybe (pure $ pure ())
+validateSchema :: Sc.JSONSchema -> JSON.Value -> ValidationOutcome JSON.Value
+validateSchema schema val = runValidation (validate schema val) emptyValidationEnv
 
 validate :: Sc.JSONSchema -> JSON.Value -> ValM JSON.Value
-validate schema val = do
-  valResults <- traverse (validate' val) (Sc.sValidators $ Sc.schema schema)
-  pure $ traverse id valResults $> val
+validate schema val = case schema of
+  Sc.BoolSchema b -> if b
+    then pure (Ok val)
+    else mkValidationError "false schema" "boolean schema is false" (JSON.Object mempty)
+  Sc.RefSchema _uri -> error "wip validate ref schema"
+  Sc.ObjectSchema schema -> do
+    valResults <- traverse (validate' val) (Sc.ojsValidators schema)
+    pure $ T.sequenceA valResults $> val
 
 validate' :: JSON.Value -> Sc.Validator -> ValM ()
 validate' value = \case
   Sc.ValAny valAny -> validateAny value valAny
   Sc.ValObject valObj -> validateObject value valObj
-  Sc.ValBool b -> validateBoolean b
   Sc.ValArray valA -> validateArray value valA
   Sc.ValNumeric valN -> validateNumeric value valN
   Sc.ValString valStr -> validateString value valStr
   Sc.ValLogic valLogic -> validateLogic value valLogic
 
+runMbValidator :: (a -> ValM ()) -> Maybe a -> ValM ()
+runMbValidator = maybe (pure $ pure ())
 
 validateAny :: JSON.Value -> Sc.AnyValidator -> ValM ()
 validateAny value valAny = F.sequenceA_ <$> sequence
@@ -222,10 +228,10 @@ validateObject value valObj = case value of
   _ -> pure $ pure ()
 
   where
-    validateProps :: Map.HashMap Text Sc.Schema -> Text -> JSON.Value -> ValM ()
+    validateProps :: Map.HashMap Text Sc.JSONSchema -> Text -> JSON.Value -> ValM ()
     validateProps props key jsonVal = Rdr.local (addDataPath key . addSchemaPath "properties") $ case Map.lookup key props of
       Nothing -> pure $ pure ()
-      Just schema -> void <$> validate (Sc.SubSchema schema) jsonVal
+      Just schema -> void <$> validate schema jsonVal
 
     validateAdditionalProps :: JSON.Object -> Sc.ObjectValidator -> ValM ()
     validateAdditionalProps o valObj =
@@ -241,17 +247,17 @@ validateObject value valObj = case value of
 
         Sc.SomeAdditionalProperties schema -> do
           result <- traverse
-            (\(k, v) -> Rdr.local (addDataPath k) $ validate (Sc.SubSchema schema) v)
+            (\(k, v) -> Rdr.local (addDataPath k) $ validate schema v)
             additionalKeyVals
           pure $ F.sequenceA_ result
 
     validatePatternProps o patternProps = Rdr.local (addSchemaPath "patternProperties") $ do
       results <- traverse (validateOnePatternProp o) (OrdMap.toList patternProps)
-      pure $ F.traverse_ (traverse id . Map.elems) results
+      pure $ F.traverse_ (T.sequenceA . Map.elems) results
 
     validateOnePatternProp o (regexp, schema) = Map.traverseWithKey
       (\k v -> if k =~ regexp
-                 then Rdr.local (addDataPath k) $ void <$> validate (Sc.SubSchema schema) v
+                 then Rdr.local (addDataPath k) $ void <$> validate schema v
                  else pure $ Ok ()
       )
       o
@@ -288,7 +294,7 @@ validateObject value valObj = case value of
 
     validatePropertyNames o schema = Rdr.local (addSchemaPath "propertyNames") $ do
       results <- forM (Map.keys o) $ \k -> do
-        res <- validate (Sc.SubSchema schema) (JSON.String k)
+        res <- validate schema (JSON.String k)
         case res of
           Ok _ -> pure $ Ok ()
           Error errs -> do
@@ -300,11 +306,6 @@ validateObject value valObj = case value of
 
       pure $ F.sequenceA_ results
 
-
-validateBoolean :: Bool -> ValM ()
-validateBoolean b = if b
-  then pure $ Ok ()
-  else mkValidationError "false schema" "boolean schema is false" (JSON.Object mempty)
 
 validateArray :: JSON.Value -> Sc.ArrayValidator -> ValM ()
 validateArray value valA = case value of
@@ -344,7 +345,7 @@ validateArray value valA = case value of
     validateItems a v = Rdr.local (addSchemaPath "items") $ case Sc.avItems v of
       Sc.SingleSchema schema -> do
         results <- iTraverse
-          (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $ validate (Sc.SubSchema schema) val)
+          (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $ validate schema val)
           a
         pure $ F.sequenceA_ results
 
@@ -352,7 +353,7 @@ validateArray value valA = case value of
         then do
           results <- iTraverse
             (\(idx, (schema, val)) -> Rdr.local (addDataPath $ Tx.pack (show idx)) $
-              validate (Sc.SubSchema schema) val)
+              validate schema val)
             (V.zip schemas a)
           pure $ F.sequenceA_ results
         else
@@ -372,23 +373,23 @@ validateArray value valA = case value of
                   -> do
                     results <- iTraverse
                       (\(idx, val) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + V.length schemas)) $
-                        validate (Sc.SubSchema schema) val)
+                        validate schema val)
                       remainingItems
                     pure $ F.sequenceA_ results
 
 
                 Sc.AdditionalMultipleSchemas schemas'
                   -> if V.length remainingItems <= V.length schemas'
-                    then do
-                      results <- iTraverse
-                        (\(idx, (s, val)) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + schemasL)) $
-                          validate (Sc.SubSchema s) val)
-                        (V.zip schemas' remainingItems)
-                      pure $ F.sequenceA_ results
-                    else mkValidationError
-                      "additionalItems"
-                      ("should NOT have more than " <> Tx.pack (show schemasL) <> " items")
-                      (JSON.Object $ Map.singleton "limit" (mkJSONNum schemasL))
+                       then do
+                         results <- iTraverse
+                           (\(idx, (s, val)) -> Rdr.local (addDataPath $ Tx.pack (show $ idx + schemasL)) $
+                             validate s val)
+                           (V.zip schemas' remainingItems)
+                         pure $ F.sequenceA_ results
+                       else mkValidationError
+                         "additionalItems"
+                         ("should NOT have more than " <> Tx.pack (show schemasL) <> " items")
+                         (JSON.Object $ Map.singleton "limit" (mkJSONNum schemasL))
 
       Sc.NoItemsValidator -> pure $ Ok ()
 
@@ -402,7 +403,7 @@ validateArray value valA = case value of
           (JSON.Object mempty)
 
     validateContains a schema = Rdr.local (addSchemaPath "contains") $ do
-      results <- mapM (validate (Sc.SubSchema schema)) a
+      results <- mapM (validate schema) a
       pure $ void $ F.asum results
 
 validateNumeric :: JSON.Value -> Sc.NumericValidator -> ValM ()
@@ -493,7 +494,7 @@ validateLogic value valLogic = F.sequenceA_ <$> sequence
 
   where
     validateNot val schema = Rdr.local (addSchemaPath "not") $
-      validate (Sc.SubSchema schema) val >>= \case
+      validate schema val >>= \case
         Error _ -> pure $ Ok ()
         Ok _ -> mkValidationError
           "not"
@@ -501,15 +502,15 @@ validateLogic value valLogic = F.sequenceA_ <$> sequence
           (JSON.Object mempty)
 
     validateAllOf val schemas = Rdr.local (addSchemaPath "allOf") $ do
-      results <- traverse (\s -> validate (Sc.SubSchema s) val) schemas
+      results <- traverse (`validate` val) schemas
       pure $ F.sequenceA_ results
 
     validateAnyOf val schemas = Rdr.local (addSchemaPath "anyOf") $ do
-      results <- mapM (\s -> validate (Sc.SubSchema s) val) schemas
+      results <- mapM (`validate` val) schemas
       pure $ void $ F.asum results
 
     validateOneOf val schemas = Rdr.local (addSchemaPath "oneOf") $ do
-      results <- mapM (\s -> validate (Sc.SubSchema s) val) schemas
+      results <- mapM (`validate` val) schemas
       let withIdx = V.zip (V.iterateN (V.length results) (+1) 0) results
       let passingWithIdx = V.filter (isOk . snd) withIdx
       if length passingWithIdx == 1

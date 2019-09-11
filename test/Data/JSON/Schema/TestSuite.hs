@@ -129,7 +129,7 @@ mkTestGroup ts = T.testGroup (Tx.unpack $ tsDescription ts) $
 
 mkTestCase :: Sc.JSONSchema -> TestSpec -> T.TestTree
 mkTestCase schema spec = T.H.testCase (Tx.unpack $ specDescription spec) $
-  case (specValid spec, Val.runValidation (Val.validate schema (specData spec)) Val.emptyValidationEnv) of
+  case (specValid spec, Val.validateSchema schema (specData spec)) of
     (True, Val.Error errs) ->
       T.H.assertFailure $ "Expected to be valid but failed with: " <> show errs <> " - for value: " <> show (specData spec) <> " - and schema: " <> show schema
     (False, Val.Ok _) ->

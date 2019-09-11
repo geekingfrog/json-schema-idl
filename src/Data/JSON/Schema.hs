@@ -1,66 +1,114 @@
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE DeriveGeneric     #-}
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards   #-}
-{-# LANGUAGE StrictData        #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StrictData                 #-}
 
 module Data.JSON.Schema where
 
-import Control.Monad (when)
-import qualified Data.HashSet as Set
 import           Control.Applicative
-import           Data.Aeson            ((.!=), (.:), (.:?), (.:!))
+import           Control.Monad         (when)
+import           Data.Aeson            ((.!=), (.:), (.:!), (.:?))
 import qualified Data.Aeson            as JSON
 import qualified Data.Aeson.Types      as JSON
 import qualified Data.Char             as Chr
 import qualified Data.Foldable         as F
+import           Data.Hashable
 import qualified Data.HashMap.Strict   as Map
+import qualified Data.HashSet          as Set
 import qualified Data.Map.Strict       as OrdMap
 import qualified Data.Maybe            as Mb
+import           Data.Scientific
+import           Data.Sequence         (ViewL ((:<), EmptyL), (<|))
+import qualified Data.Sequence         as Seq
 import           Data.Text             (Text)
-import           Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text             as Tx
+import           Data.Text.Encoding    (encodeUtf8)
 import qualified Data.Vector           as V
 import           GHC.Generics
+import qualified Network.URI           as U
 import qualified Text.Regex.PCRE.Heavy as RE
-import Data.Scientific
 
 data JSONSchema
-  = RootSchema RootMetadata Schema
-  | SubSchema Schema
+  = BoolSchema Bool
+  | RefSchema URI
+  | ObjectSchema ObjectJSONSchema
+
+  -- JSONSchema
+  -- { jsVersion :: Maybe SchemaVersion
+  -- , jsId :: Maybe SchemaId
+  -- , jsComment :: Maybe Text
+  -- , jsSchema :: Schema
+  -- }
+  -- = RootSchema RootMetadata Schema
+  -- | SubSchema Schema
   deriving (Eq, Show)
 
 instance JSON.FromJSON JSONSchema where
   parseJSON raw
-    = JSON.withBool "boolean JSONschema" parseBool raw
-    <|> JSON.withObject "object JSONschema" parseObject raw
+    = JSON.withBool "boolean JSONSchema" parseBool raw
+    <|> JSON.withObject "object ref JSONSchema" parseRef raw
+    <|> JSON.withObject "object JSONSchema" parseObject raw
 
     where
-      parseObject o = do
-        mbVersion <- o .:? "$schema" -- TODO check this is a valid URI
-        i <- o .:? "$id"
-        case mbVersion of
-          Just ver -> RootSchema (RootMetadata ver i) <$> JSON.parseJSON raw
-          Nothing -> SubSchema <$> JSON.parseJSON raw
-      parseBool b = pure $ SubSchema $ Schema Nothing Nothing (V.singleton (ValBool b))
+      parseBool b = pure $ BoolSchema b
+      parseRef o = RefSchema <$> JSON.parseJSON raw
+      parseObject o = ObjectSchema <$> JSON.parseJSON raw
+
+      -- parseObject o = do
+      --   mbVersion <- o .:? "$schema" -- TODO check this is a valid URI
+      --   i <- o .:? "$id"
+      --   case mbVersion of
+      --     Just ver -> RootSchema (RootMetadata ver i) <$> JSON.parseJSON raw
+      --     Nothing -> SubSchema <$> JSON.parseJSON raw
 
 
-schema :: JSONSchema -> Schema
-schema = \case
-  (RootSchema _ s) -> s
-  (SubSchema s) -> s
-
-validators :: JSONSchema -> V.Vector Validator
-validators = \case
-  (RootSchema _ s) -> sValidators s
-  (SubSchema s) -> sValidators s
-
-data RootMetadata = RootMetadata
-  { rmVersion :: SchemaVersion
-  , rmId :: Maybe Text
+data ObjectJSONSchema = ObjectJSONSchema
+  { ojsDescription :: Maybe Text
+  , ojsTitle :: Maybe Text
+  , ojsId :: Maybe SchemaId
+  , ojsVersion :: Maybe SchemaVersion
+  , ojsValidators :: V.Vector Validator
+  , ojsDefinitions :: Definitions
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic)
+
+instance JSON.FromJSON ObjectJSONSchema where
+  parseJSON = JSON.withObject "ObjectJSONSchema" $ \o -> do
+    ojsDescription <- o .:? "description"
+    ojsTitle <- o .:? "title"
+    ojsId <- o .:? "$id"
+    ojsVersion <- o .:? "$schema"
+    ojsValidators <- parseAllValidators o
+    ojsDefinitions <- o .:? "definitions" .!= mempty
+    pure ObjectJSONSchema{..}
+
+newtype URI = URI { getURI :: U.URI }
+  deriving (Eq, Show, Generic, Ord)
+
+instance JSON.FromJSON URI where
+  parseJSON = JSON.withText "URI" $ \rawTxt -> do
+    let rawStr = Tx.unpack rawTxt
+    case U.parseURIReference rawStr of
+      Nothing -> fail $ "Cannot parse URI from: " <> rawStr
+      Just uri -> pure $ URI uri
+
+instance JSON.FromJSONKey URI where
+  fromJSONKey = JSON.FromJSONKeyValue JSON.parseJSON
+
+relativeTo :: URI -> URI -> URI
+relativeTo (URI u1) (URI u2) = URI (u1 `U.relativeTo` u2)
+
+newtype SchemaId = SchemaId { getSchemaId :: URI }
+  deriving stock (Eq, Show)
+  deriving newtype (JSON.FromJSON)
+
+newtype Definitions = Definitions { getDefinitions :: Map.HashMap Text JSONSchema }
+  deriving stock (Eq, Show)
+  deriving newtype (JSON.FromJSON, Semigroup, Monoid)
 
 data SchemaVersion = Draft07
   deriving (Eq, Show)
@@ -71,31 +119,93 @@ instance JSON.FromJSON SchemaVersion where
       then pure Draft07
       else fail $ "Only draft 7 is supported, got $schema = " <> Tx.unpack t
 
-data Schema = Schema
-  { sDescription :: Maybe Text
-  , sTitle :: Maybe Text
-  , sValidators :: V.Vector Validator
-  }
-  deriving (Eq, Show, Generic)
+-- | For quick access to schemas when references are involved
+aggregateReferences :: JSONSchema -> OrdMap.Map URI JSONSchema
+aggregateReferences schema = case schema of
+  BoolSchema _ -> mempty
+  RefSchema _ -> mempty
+  ObjectSchema o ->
+    let Just emptyURI = U.parseURIReference ""
+        baseURI = maybe (URI emptyURI) getSchemaId (ojsId o)
+     in aggregateReferences' (Seq.singleton (baseURI, schema)) mempty
 
-instance JSON.FromJSON Schema where
-  parseJSON raw
-    = JSON.withBool "boolean subschema" parseBool raw
-    <|> JSON.withObject "object subschema" parseObject raw
 
-    where
-      parseObject o = do
-        desc <- o .:? "description"
-        title <- o .:? "title"
-        validations <- parseAllValidators o
-        pure $ Schema desc title validations
+aggregateReferences'
+  :: Seq.Seq (URI, JSONSchema)
+  -> OrdMap.Map URI JSONSchema
+  -> OrdMap.Map URI JSONSchema
 
-      parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
+aggregateReferences' seq seen = case Seq.viewl seq of
+  EmptyL -> seen
+  (baseURI, schema) :< rest -> if baseURI `OrdMap.member` seen
+    then aggregateReferences' rest seen
+    else case schema of
+      BoolSchema _ -> aggregateReferences' rest seen
+      RefSchema _ -> aggregateReferences' rest seen
+      ObjectSchema o ->
+        let baseURI' = maybe baseURI ((`relativeTo` baseURI) . getSchemaId) (ojsId o)
+            seen' = OrdMap.insert baseURI schema seen
+            defs = getDefinitions (ojsDefinitions o)
+            f (queue, acc) k schema' =
+              let uri' = addFragment ("definitions/" <> k) baseURI
+                  queue' = (uri', schema') <| queue
+                  acc' = case getSchemaId <$> schemaId schema' of
+                    Nothing -> acc
+                    Just newRoot ->
+                       aggregateReferences' (Seq.singleton (newRoot `relativeTo` baseURI', schema')) acc
+               in (queue', acc')
+            (seq', seen2) = Map.foldlWithKey' f (rest, mempty) defs
+         in aggregateReferences' seq' (OrdMap.union seen' seen2)
+
+addFragment :: Text -> URI -> URI
+addFragment frag (URI u) =
+  let existingFrag = U.uriFragment u
+      f = if null existingFrag
+            then "#"
+            else existingFrag
+  in URI $ u {U.uriFragment = f <> "/" <> Tx.unpack frag}
+
+schemaId :: JSONSchema -> Maybe SchemaId
+schemaId = \case
+  BoolSchema _ -> Nothing
+  RefSchema _ -> Nothing
+  ObjectSchema o -> ojsId o
+
+definitions :: JSONSchema -> Maybe Definitions
+definitions = \case
+  ObjectSchema o -> Just $ ojsDefinitions o
+  _ -> Nothing
+
+-- -- data Schema
+-- --   = BoolSchema !Bool
+-- --   | RefSchema !U.URI
+-- --   | ObjectSchema ObjectJSONSchema
+-- --   deriving (Eq, Show)
+--
+-- -- data Schema = Schema
+-- --   { sDescription :: Maybe Text
+-- --   , sTitle :: Maybe Text
+-- --   , sValidators :: V.Vector Validator
+-- --   }
+-- --   deriving (Eq, Show, Generic)
+--
+-- instance JSON.FromJSON Schema where
+--   parseJSON raw
+--     = JSON.withBool "boolean subschema" parseBool raw
+--     <|> JSON.withObject "object subschema" parseObject raw
+--
+--     where
+--       parseObject o = do
+--         desc <- o .:? "description"
+--         title <- o .:? "title"
+--         validations <- parseAllValidators o
+--         pure $ Schema desc title validations
+--
+--       parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
 
 data Validator
   = ValAny AnyValidator
   | ValObject ObjectValidator
-  | ValBool Bool
   | ValArray ArrayValidator
   | ValNumeric NumericValidator
   | ValString StringValidator
@@ -169,13 +279,13 @@ parseAnyValidator o = do
     else pure $ Just $ AnyValidator{..}
 
 data ObjectValidator = ObjectValidator
-  { ovProperties      :: Map.HashMap Text Schema
+  { ovProperties      :: Map.HashMap Text JSONSchema
   , ovAdditionalProps :: AdditionalProperties
-  , ovPatternProps    :: OrdMap.Map RE.Regex Schema
+  , ovPatternProps    :: OrdMap.Map RE.Regex JSONSchema
   , ovRequired        :: RequiredProperties
   , ovMinProps        :: Maybe (Positive Int)
   , ovMaxProps        :: Maybe (Positive Int)
-  , ovPropertyNames   :: Maybe Schema
+  , ovPropertyNames   :: Maybe JSONSchema
   }
   deriving (Eq, Show)
 
@@ -190,7 +300,7 @@ instance (Ord a, Num a, JSON.FromJSON a) => JSON.FromJSON (Positive a) where
 
 data AdditionalProperties
   = NoAdditionalProperties
-  | SomeAdditionalProperties Schema
+  | SomeAdditionalProperties JSONSchema
   | AllAdditionalProperties
   deriving (Eq, Show)
 
@@ -232,7 +342,7 @@ parseAdditionalProperties o = o .:? "additionalProperties" >>= \case
   Just (JSON.Bool False) -> pure NoAdditionalProperties
   Just x -> SomeAdditionalProperties <$> JSON.parseJSON x
 
-parsePatternProperties :: JSON.Object -> JSON.Parser (OrdMap.Map RE.Regex Schema)
+parsePatternProperties :: JSON.Object -> JSON.Parser (OrdMap.Map RE.Regex JSONSchema)
 parsePatternProperties o = o .:? "patternProperties" >>= \case
   Nothing -> pure mempty
   Just x -> flip (JSON.withObject "patternProperties object") x $ \o' ->
@@ -242,7 +352,7 @@ parsePatternProperties o = o .:? "patternProperties" >>= \case
 
   where
     pcreOptions = []
-    mkTuples :: (Text, JSON.Value) -> Either String (RE.Regex, Schema)
+    mkTuples :: (Text, JSON.Value) -> Either String (RE.Regex, JSONSchema)
     mkTuples (k, v) = do
       r <- RE.compileM (encodeUtf8 k) pcreOptions
       s <- JSON.parseEither JSON.parseJSON v
@@ -255,13 +365,13 @@ data ArrayValidator = ArrayValidator
   , avItems           :: ItemsValidator
   , avAdditionalItems :: AdditionalItemsValidator
   , avUniqueItems     :: UniqueItems
-  , avContainsItem    :: Maybe Schema
+  , avContainsItem    :: Maybe JSONSchema
   }
   deriving (Eq, Show)
 
 data ItemsValidator
-  = SingleSchema Schema
-  | MultipleSchemas (V.Vector Schema)
+  = SingleSchema JSONSchema
+  | MultipleSchemas (V.Vector JSONSchema)
   | NoItemsValidator
   deriving (Eq, Show)
 
@@ -271,8 +381,8 @@ instance JSON.FromJSON ItemsValidator where
     <|> (MultipleSchemas <$> JSON.parseJSON raw)
 
 data AdditionalItemsValidator
-  = AdditionalSingleSchema Schema
-  | AdditionalMultipleSchemas (V.Vector Schema)
+  = AdditionalSingleSchema JSONSchema
+  | AdditionalMultipleSchemas (V.Vector JSONSchema)
   | AdditionalAllAllowed
   | AdditionalAllForbidden
   deriving (Eq, Show)
@@ -359,10 +469,10 @@ parseStringValidator o = do
     else pure $ Just StringValidator{..}
 
 data LogicValidator = LogicValidator
-  { lvNot :: Maybe Schema
-  , lvAllOf :: V.Vector Schema
-  , lvAnyOf :: V.Vector Schema
-  , lvOneOf :: V.Vector Schema
+  { lvNot :: Maybe JSONSchema
+  , lvAllOf :: V.Vector JSONSchema
+  , lvAnyOf :: V.Vector JSONSchema
+  , lvOneOf :: V.Vector JSONSchema
   }
   deriving (Eq, Show)
 

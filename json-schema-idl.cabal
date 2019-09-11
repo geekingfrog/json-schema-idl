@@ -29,6 +29,8 @@ library
                      , pcre-heavy
                      , mtl
                      , aeson-pretty
+                     , network-uri
+                     , hashable
 
   ghc-options:         -fwarn-incomplete-patterns -Werror
   exposed-modules:     Data.JSON.Schema
