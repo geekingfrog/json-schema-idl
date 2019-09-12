@@ -55,7 +55,8 @@ instance JSON.FromJSON JSONSchema where
 
     where
       parseBool b = pure $ BoolSchema b
-      parseRef o = RefSchema <$> JSON.parseJSON raw
+      -- parseRef o = RefSchema <$> JSON.parseJSON raw
+      parseRef o = RefSchema <$> o .: "$ref"
       parseObject o = ObjectSchema <$> JSON.parseJSON raw
 
       -- parseObject o = do
@@ -176,32 +177,11 @@ definitions = \case
   ObjectSchema o -> Just $ ojsDefinitions o
   _ -> Nothing
 
--- -- data Schema
--- --   = BoolSchema !Bool
--- --   | RefSchema !U.URI
--- --   | ObjectSchema ObjectJSONSchema
--- --   deriving (Eq, Show)
---
--- -- data Schema = Schema
--- --   { sDescription :: Maybe Text
--- --   , sTitle :: Maybe Text
--- --   , sValidators :: V.Vector Validator
--- --   }
--- --   deriving (Eq, Show, Generic)
---
--- instance JSON.FromJSON Schema where
---   parseJSON raw
---     = JSON.withBool "boolean subschema" parseBool raw
---     <|> JSON.withObject "object subschema" parseObject raw
---
---     where
---       parseObject o = do
---         desc <- o .:? "description"
---         title <- o .:? "title"
---         validations <- parseAllValidators o
---         pure $ Schema desc title validations
---
---       parseBool b = pure $ Schema Nothing Nothing (V.singleton (ValBool b))
+validators :: JSONSchema -> Maybe (V.Vector Validator)
+validators = \case
+  ObjectSchema o -> Just $ ojsValidators o
+  _ -> Nothing
+
 
 data Validator
   = ValAny AnyValidator
@@ -211,6 +191,17 @@ data Validator
   | ValString StringValidator
   | ValLogic LogicValidator
   deriving (Eq, Show)
+
+-- to avoid importing some heavy prisms
+objectValidator :: Validator -> Maybe ObjectValidator
+objectValidator = \case
+  ValObject vs -> Just vs
+  _ -> Nothing
+
+arrayValidator :: Validator -> Maybe ArrayValidator
+arrayValidator = \case
+  ValArray a -> Just a
+  _ -> Nothing
 
 parseAllValidators :: JSON.Object -> JSON.Parser (V.Vector Validator)
 parseAllValidators o = do

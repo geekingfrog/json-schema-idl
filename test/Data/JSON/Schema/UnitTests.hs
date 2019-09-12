@@ -24,6 +24,7 @@ tests :: T.TestTree
 tests = T.testGroup "unit tests"
   [ randomTest
   , aggregateReferences
+  , miscTest
   ]
 
 
@@ -135,12 +136,15 @@ aggregateReferences = T.H.testCase "aggregateReferences" $ do
 
 randomTest :: T.TestTree
 randomTest = T.H.testCaseSteps "boom" $ \step -> do
-  let val = [JSON.aesonQQ|1|]
   let rawSchema = [JSON.aesonQQ|
         {
-            "items": false
+            "properties": {
+                "foo": {"$ref": "#"}
+            },
+            "additionalProperties": false
         }
-    |]
+      |]
+  let val = [JSON.aesonQQ|{"foo": {"foo": false}}|]
 
   case parseSchema rawSchema of
     Left err -> do
@@ -161,6 +165,19 @@ randomTest = T.H.testCaseSteps "boom" $ \step -> do
 
 parseSchema :: JSON.Value -> Either String Sc.JSONSchema
 parseSchema = JSON.parseEither JSON.parseJSON
+
+miscTest :: T.TestTree
+miscTest = T.H.testCaseSteps "misc" $ \step -> do
+  sanitize "#" @=? ""
+  sanitize "#/" @=? ""
+
+sanitize :: String -> String
+sanitize = \case
+  [] -> []
+  ('/' : rest) -> rest
+  ('#' : rest) -> sanitize rest
+  frag -> frag
+
 
 -- -- in any order
 -- expectValidators :: (HasCallStack) => [Sc.Validator] -> Either String Sc.JSONSchema -> T.H.Assertion

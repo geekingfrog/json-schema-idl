@@ -31,6 +31,8 @@ library
                      , aeson-pretty
                      , network-uri
                      , hashable
+                     , split
+                     , safe
 
   ghc-options:         -fwarn-incomplete-patterns -Werror
   exposed-modules:     Data.JSON.Schema

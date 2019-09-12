@@ -14,6 +14,7 @@ module Data.JSON.Validation where
 
 import           Debug.Trace
 
+import qualified Data.List.Split as Split
 import           Control.Applicative
 import           Control.Monad
 import qualified Control.Monad.Reader  as Rdr
@@ -37,6 +38,8 @@ import qualified Data.Typeable         as Typeable
 import qualified Data.Vector           as V
 import           GHC.Generics
 import           Text.Regex.PCRE.Heavy ((=~))
+import qualified Network.URI as U
+import qualified Safe
 
 import qualified Data.JSON.Schema      as Sc
 
@@ -99,6 +102,11 @@ data ValidationError = ValidationError
   }
   deriving (Eq, Show, Generic, JSON.ToJSON)
 
+newtype ValidationM a = ValidationM { runValidationM :: Rdr.Reader ValidationEnv a }
+  deriving newtype (Functor, Applicative, Monad, Rdr.MonadReader ValidationEnv)
+
+type ValM a = ValidationM (ValidationOutcome a)
+
 mkValidationError :: Text -> Text -> JSON.Value -> ValM a
 mkValidationError keyword msg params = (\e -> Error [e]) <$> mkValidationError' keyword msg params
 
@@ -115,39 +123,84 @@ mkValidationError' keyword msg params = Rdr.ask >>= \env -> pure
 data ValidationEnv = ValidationEnv
   { veDataPath :: [Text]
   , veSchemaPath :: [Text]
+  -- , veReferences :: OrdMap.Map Sc.URI Sc.JSONSchema
+  , veRootSchema :: Sc.JSONSchema
   }
   deriving (Eq, Show)
-
-emptyValidationEnv :: ValidationEnv
-emptyValidationEnv = ValidationEnv [] []
 
 addSchemaPath, addDataPath :: Text -> ValidationEnv -> ValidationEnv
 addSchemaPath path env = env {veSchemaPath = path : veSchemaPath env}
 addDataPath path env = env {veDataPath = path : veDataPath env}
 
-newtype ValidationM a = ValidationM { runValidationM :: Rdr.Reader ValidationEnv a }
-  deriving newtype (Functor, Applicative, Monad, Rdr.MonadReader ValidationEnv)
-
-type ValM a = ValidationM (ValidationOutcome a)
-
 runValidation :: ValidationM a -> ValidationEnv -> a
 runValidation m = Rdr.runReader (runValidationM m)
 
 validateSchema :: Sc.JSONSchema -> JSON.Value -> ValidationOutcome JSON.Value
-validateSchema schema val = runValidation (validate schema val) emptyValidationEnv
+validateSchema schema val =
+  let env = ValidationEnv
+        { veDataPath = []
+        , veSchemaPath = []
+        -- , veReferences = Sc.aggregateReferences schema
+        , veRootSchema = schema
+        }
+   in runValidation (validate schema val) env
 
 validate :: Sc.JSONSchema -> JSON.Value -> ValM JSON.Value
 validate schema val = case schema of
   Sc.BoolSchema b -> if b
     then pure (Ok val)
     else mkValidationError "false schema" "boolean schema is false" (JSON.Object mempty)
-  Sc.RefSchema _uri -> error "wip validate ref schema"
+  Sc.RefSchema uri -> validateRefSchema uri val
   Sc.ObjectSchema schema -> do
-    valResults <- traverse (validate' val) (Sc.ojsValidators schema)
+    valResults <- traverse (validateObjectSchema val) (Sc.ojsValidators schema)
     pure $ T.sequenceA valResults $> val
 
-validate' :: JSON.Value -> Sc.Validator -> ValM ()
-validate' value = \case
+validateRefSchema :: Sc.URI -> JSON.Value -> ValM JSON.Value
+validateRefSchema uri val = do
+  rootSchema <- Rdr.asks veRootSchema
+  let mbRootUri = Sc.schemaId rootSchema
+  let refUri = maybe uri ((uri `Sc.relativeTo`) . Sc.getSchemaId) (Sc.schemaId rootSchema)
+  -- TODO switch schema if base+path isn't the same as root schema
+
+  let fragment = U.uriFragment $ Sc.getURI refUri
+  if not (null $ U.uriScheme $ Sc.getURI refUri)
+    then error "doesn't support absolute schema ref yet"
+    else case resolveFragment rootSchema fragment of
+      Nothing -> mkValidationError
+        "$ref" ("No schema found for fragment " <> Tx.pack fragment) val
+      Just s -> validate s val
+
+  where
+    withoutFragment (Sc.URI u) = Sc.URI $ u {U.uriFragment = ""}
+
+resolveFragment :: Sc.JSONSchema -> String -> Maybe Sc.JSONSchema
+resolveFragment schema fragment =
+  case Split.splitOn "/" (sanitize fragment) of
+    [""] -> Just schema
+    ["properties", prop] -> do
+      vs <- Sc.validators schema
+      ovs <- F.asum (fmap Sc.objectValidator vs)
+      Map.lookup (Tx.pack prop) (Sc.ovProperties ovs)
+    ["items", strIdx] -> do
+      vs <- Sc.validators schema
+      avs <- F.asum (fmap Sc.arrayValidator vs)
+      idx <- Safe.readMay strIdx
+      case Sc.avItems avs of
+        Sc.SingleSchema s -> if idx == 0 then Just s else Nothing
+        Sc.MultipleSchemas ss -> ss V.!? idx
+        Sc.NoItemsValidator -> Nothing
+    _ -> Nothing
+
+  where
+    sanitize = \case
+      [] -> []
+      ('/' : rest) -> rest
+      ('#' : rest) -> sanitize rest
+      frag -> frag
+
+
+validateObjectSchema :: JSON.Value -> Sc.Validator -> ValM ()
+validateObjectSchema value = \case
   Sc.ValAny valAny -> validateAny value valAny
   Sc.ValObject valObj -> validateObject value valObj
   Sc.ValArray valA -> validateArray value valA
