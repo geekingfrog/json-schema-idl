@@ -25,6 +25,7 @@ tests = T.testGroup "unit tests"
   [ randomTest
   , aggregateReferences
   , miscTest
+  , findSchemaTest
   ]
 
 
@@ -138,12 +139,16 @@ randomTest :: T.TestTree
 randomTest = T.H.testCaseSteps "boom" $ \step -> do
   let rawSchema = [JSON.aesonQQ|
         {
+            "tilda~field": {"type": "integer"},
+            "slash/field": {"type": "integer"},
+            "percent%field": {"type": "integer"},
             "properties": {
-                "foo": {"$ref": "#"}
-            },
-            "additionalProperties": false
+                "tilda": {"$ref": "#/tilda~0field"},
+                "slash": {"$ref": "#/slash~1field"},
+                "percent": {"$ref": "#/percent%25field"}
+            }
         }
-      |]
+        |]
   let val = [JSON.aesonQQ|{"foo": {"foo": false}}|]
 
   case parseSchema rawSchema of
@@ -168,16 +173,46 @@ parseSchema = JSON.parseEither JSON.parseJSON
 
 miscTest :: T.TestTree
 miscTest = T.H.testCaseSteps "misc" $ \step -> do
-  sanitize "#" @=? ""
-  sanitize "#/" @=? ""
+  let json = [JSON.aesonQQ|
+        {
+            "allOf": [{
+                "$ref": "#foo"
+            }],
+            "definitions": {
+                "A": {
+                    "$id": "#foo",
+                    "type": "integer"
+                }
+            }
+        }
+        |]
 
-sanitize :: String -> String
-sanitize = \case
-  [] -> []
-  ('/' : rest) -> rest
-  ('#' : rest) -> sanitize rest
-  frag -> frag
+  let jsonData = [JSON.aesonQQ|2|]
 
+  let (Right schema) = parseSchema json
+  step $ show $ OrdMap.keys $ Sc.aggregateReferences schema
+  step $ show $ Val.validateSchema schema jsonData
+  pure ()
+
+findSchemaTest :: T.TestTree
+findSchemaTest = T.testGroup "findSchema"
+  [ T.H.testCase "one level, object" $ do
+      let json = [JSON.aesonQQ|{"foo": true}|]
+      assertIsJust $ Val.findSchema json "#/foo"
+
+  , T.H.testCase "one level, array" $ do
+      let json = [JSON.aesonQQ|[1, true]|]
+      assertIsJust $ Val.findSchema json "#/1"
+
+  , T.H.testCase "nested" $ do
+      let json = [JSON.aesonQQ|{"foo": [1, {"bar": false}]}|]
+      assertIsJust $ Val.findSchema json "#/foo/1/bar"
+  ]
+
+assertIsJust :: HasCallStack => Maybe a -> T.H.Assertion
+assertIsJust = \case
+  Just _ -> pure ()
+  _ -> T.H.assertFailure "Expected a Just but got Nothing"
 
 -- -- in any order
 -- expectValidators :: (HasCallStack) => [Sc.Validator] -> Either String Sc.JSONSchema -> T.H.Assertion

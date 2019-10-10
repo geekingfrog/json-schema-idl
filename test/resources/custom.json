@@ -1,0 +1,46 @@
+[
+  {
+    "description": "simple definition reference",
+    "schema": {
+      "definitions": {
+        "foo": { "type": "integer" }
+      },
+      "properties": {
+        "prop": { "$ref": "#/foo" }
+      }
+    },
+    "tests": [
+      {
+        "description": "invalid property",
+        "data": {"prop": "foo"},
+        "valid": false
+      },
+      {
+        "description": "valid property",
+        "data": {"prop": 2},
+        "valid": true
+      }
+    ]
+  },
+  {
+    "description": "nested schema",
+    "schema": {
+      "foo": {
+        "bar": { "type": "integer" }
+      },
+      "properties": {
+        "foo": {"$ref": "#/foo/bar"}
+      }
+    },
+    "tests": [
+      { "description": "match",
+        "data": {"foo": 2},
+        "valid": true
+      },
+      { "description": "no match",
+        "data": {"foo": "dat string though"},
+        "valid": false
+      }
+    ]
+  }
+]

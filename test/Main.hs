@@ -8,10 +8,12 @@ import qualified Data.JSON.Schema.UnitTests as Unit
 
 main :: IO ()
 main = do
-  testSuite <- TS.buildTestSuites -- >>= T.defaultMain
+  testSuite <- TS.buildOfficialTestSuites
+  customTestSuite <- TS.buildCustomTestSuites
   let fullTests = T.testGroup "All Tests"
-        [ testSuite
-        , Unit.tests
-        ]
-        -- [Unit.tests]
+        -- [ testSuite
+        -- , customTestSuite
+        -- , Unit.tests
+        -- ]
+        [testSuite]
   T.defaultMain fullTests

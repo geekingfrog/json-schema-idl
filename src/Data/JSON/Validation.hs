@@ -19,6 +19,7 @@ import           Control.Applicative
 import           Control.Monad
 import qualified Control.Monad.Reader  as Rdr
 import qualified Data.Aeson            as JSON
+import qualified Data.Aeson.Types      as JSON
 import qualified Data.Aeson.Text       as JSON.Tx
 import qualified Data.ByteString.Lazy  as LBS
 import qualified Data.Foldable         as F
@@ -123,7 +124,7 @@ mkValidationError' keyword msg params = Rdr.ask >>= \env -> pure
 data ValidationEnv = ValidationEnv
   { veDataPath :: [Text]
   , veSchemaPath :: [Text]
-  -- , veReferences :: OrdMap.Map Sc.URI Sc.JSONSchema
+  , veReferences :: OrdMap.Map Sc.URI Sc.JSONSchema
   , veRootSchema :: Sc.JSONSchema
   }
   deriving (Eq, Show)
@@ -140,7 +141,8 @@ validateSchema schema val =
   let env = ValidationEnv
         { veDataPath = []
         , veSchemaPath = []
-        -- , veReferences = Sc.aggregateReferences schema
+        -- only collect references from the root schema
+        , veReferences = Sc.aggregateReferences schema
         , veRootSchema = schema
         }
    in runValidation (validate schema val) env
@@ -150,46 +152,81 @@ validate schema val = case schema of
   Sc.BoolSchema b -> if b
     then pure (Ok val)
     else mkValidationError "false schema" "boolean schema is false" (JSON.Object mempty)
-  Sc.RefSchema uri -> validateRefSchema uri val
+  Sc.RefSchema r -> validateRefSchema r val
   Sc.ObjectSchema schema -> do
     valResults <- traverse (validateObjectSchema val) (Sc.ojsValidators schema)
     pure $ T.sequenceA valResults $> val
 
-validateRefSchema :: Sc.URI -> JSON.Value -> ValM JSON.Value
-validateRefSchema uri val = do
+validateRefSchema :: Sc.RefJSONSchema -> JSON.Value -> ValM JSON.Value
+validateRefSchema rs val = do
   rootSchema <- Rdr.asks veRootSchema
+  let uri = Sc.rjsURI rs
   let mbRootUri = Sc.schemaId rootSchema
   let refUri = maybe uri ((uri `Sc.relativeTo`) . Sc.getSchemaId) (Sc.schemaId rootSchema)
   -- TODO switch schema if base+path isn't the same as root schema
 
+  allReferences <- Rdr.asks veReferences
+  -- case OrdMap.lookup refUri allReferences of
+  --   Nothing -> error "foo"
+  --   Just s -> validate s val
+
   let fragment = U.uriFragment $ Sc.getURI refUri
   if not (null $ U.uriScheme $ Sc.getURI refUri)
     then error "doesn't support absolute schema ref yet"
-    else case resolveFragment rootSchema fragment of
-      Nothing -> mkValidationError
-        "$ref" ("No schema found for fragment " <> Tx.pack fragment) val
-      Just s -> validate s val
+    else do
+      let byId = note
+            ("No schema found for absolute reference " <> showT refUri)
+            (OrdMap.lookup refUri allReferences)
+      let byFragment = resolveFragment rootSchema fragment
+
+      -- Annoyingly, `Either Text` doesn't have an alternative instance
+      let eitherSchema = either (const byFragment) Right byId
+      case eitherSchema of
+        Left err -> mkValidationError
+          "$ref" ("No schema found for fragment " <> Tx.pack fragment <> " because " <> err) val
+        Right s -> validate s val
 
   where
     withoutFragment (Sc.URI u) = Sc.URI $ u {U.uriFragment = ""}
 
-resolveFragment :: Sc.JSONSchema -> String -> Maybe Sc.JSONSchema
+resolveFragment :: Sc.JSONSchema -> String -> Either Text Sc.JSONSchema
 resolveFragment schema fragment =
-  case Split.splitOn "/" (sanitize fragment) of
-    [""] -> Just schema
-    ["properties", prop] -> do
-      vs <- Sc.validators schema
-      ovs <- F.asum (fmap Sc.objectValidator vs)
-      Map.lookup (Tx.pack prop) (Sc.ovProperties ovs)
-    ["items", strIdx] -> do
-      vs <- Sc.validators schema
-      avs <- F.asum (fmap Sc.arrayValidator vs)
-      idx <- Safe.readMay strIdx
+  case chunkFrag fragment of
+    ("", "") -> Right schema
+    ("properties", rest) -> do
+      let (prop, rest') = chunkFrag rest
+      vs <- note "No validators" $ Sc.validators schema
+      ovs <- note "No item validator found" $ F.asum (fmap Sc.objectValidator vs)
+      nextSchema <- note ("No schema found under key " <> showT prop) $ Map.lookup prop (Sc.ovProperties ovs)
+      resolveFragment nextSchema rest'
+
+    ("items", rest) -> do
+      let (strIdx, rest') = chunkFrag rest
+      vs <- note "No validator found" $ Sc.validators schema
+      avs <- note "No array validator found" $ F.asum (fmap Sc.arrayValidator vs)
+      idx <- note ("Invalid index: " <> strIdx) $ Safe.readMay $ Tx.unpack strIdx
       case Sc.avItems avs of
-        Sc.SingleSchema s -> if idx == 0 then Just s else Nothing
-        Sc.MultipleSchemas ss -> ss V.!? idx
-        Sc.NoItemsValidator -> Nothing
-    _ -> Nothing
+        Sc.SingleSchema s -> if idx == 0
+          then resolveFragment s rest'
+          else Left ("No item schema found for index " <> strIdx)
+        Sc.MultipleSchemas ss -> do
+          nextSchema <- note ("No item schema found for index " <> strIdx) $ ss V.!? idx
+          resolveFragment nextSchema rest'
+        Sc.NoItemsValidator -> Left ("no items validator found for " <> Tx.pack fragment)
+
+    (kw, rest) -> if kw == "definitions"
+      then do
+        definitions <- note "No definitions found" $ Sc.getDefinitions <$> Sc.definitions schema
+        let (def, remainingFrag) = chunkFrag rest
+        let properDef = unEscape def
+        case Map.lookup properDef definitions of
+          Just nextSchema -> resolveFragment nextSchema remainingFrag
+          Nothing -> Left $ "No definition found for: " <> def <> " (real ref searched: " <> properDef <> ")"
+      else do
+        os <- note "No json object found" $ Sc.rawObject schema
+        note
+          ("No schema found for json pointer" <> Tx.pack fragment)
+          (findSchema (JSON.Object os) (Tx.pack fragment))
 
   where
     sanitize = \case
@@ -198,6 +235,51 @@ resolveFragment schema fragment =
       ('#' : rest) -> sanitize rest
       frag -> frag
 
+    chunkFrag str =
+      let (h, t) = span (/= '/') (sanitize str)
+       in (unEscape $ Tx.pack h, t)
+
+
+findSchemaByAbsoluteRef
+  :: OrdMap.Map Sc.URI Sc.JSONSchema
+  -> Sc.URI
+  -> Maybe Sc.JSONSchema
+
+findSchemaByAbsoluteRef =
+  let
+  in error "foo"
+
+
+unEscape :: Text -> Text
+unEscape str = if Tx.null str
+  then str
+  else
+    Tx.replace "~0" "~"
+    $ Tx.replace "~1" "/"
+    $ Tx.replace "%22" "\""
+    $ Tx.replace "%25" "%" str
+
+
+-- given a json pointer, try to drill down and get a schema at the location
+findSchema :: JSON.Value -> Text -> Maybe Sc.JSONSchema
+findSchema val pointer =
+  let (firstChar, rest) = Tx.splitAt 2 pointer
+   in if firstChar /= "#/"
+        then Nothing
+        else go val (Tx.split (== '/') rest)
+
+  where
+    go val = \case
+      [] -> JSON.parseMaybe JSON.parseJSON val
+      (pointer : rest) -> case val of
+        JSON.Object obj -> do
+          val' <- Map.lookup (unEscape pointer) obj
+          go val' rest
+        JSON.Array arr -> do
+          idx <- Safe.readMay (Tx.unpack pointer)
+          val' <- arr V.!? idx
+          go val' rest
+        _ -> Nothing
 
 validateObjectSchema :: JSON.Value -> Sc.Validator -> ValM ()
 validateObjectSchema value = \case
@@ -584,3 +666,16 @@ validateLogic value valLogic = F.sequenceA_ <$> sequence
 
 mkJSONNum :: Int -> JSON.Value
 mkJSONNum x = JSON.Number $ Scientific.scientific (fromIntegral x) 0
+
+
+
+hush :: Either e a -> Maybe a
+hush (Left _) = Nothing
+hush (Right x) = Just x
+
+note :: e -> Maybe a -> Either e a
+note msg Nothing = Left msg
+note _ (Just x) = Right x
+
+showT :: Show a => a -> Text
+showT = Tx.pack . show

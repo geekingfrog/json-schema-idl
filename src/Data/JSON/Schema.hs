@@ -10,7 +10,7 @@
 module Data.JSON.Schema where
 
 import           Control.Applicative
-import           Control.Monad         (when)
+import           Control.Monad         (when, (>=>))
 import           Data.Aeson            ((.!=), (.:), (.:!), (.:?))
 import qualified Data.Aeson            as JSON
 import qualified Data.Aeson.Types      as JSON
@@ -34,7 +34,7 @@ import qualified Text.Regex.PCRE.Heavy as RE
 
 data JSONSchema
   = BoolSchema Bool
-  | RefSchema URI
+  | RefSchema RefJSONSchema
   | ObjectSchema ObjectJSONSchema
 
   -- JSONSchema
@@ -55,17 +55,23 @@ instance JSON.FromJSON JSONSchema where
 
     where
       parseBool b = pure $ BoolSchema b
-      -- parseRef o = RefSchema <$> JSON.parseJSON raw
-      parseRef o = RefSchema <$> o .: "$ref"
-      parseObject o = ObjectSchema <$> JSON.parseJSON raw
+      parseRef _o = RefSchema <$> JSON.parseJSON raw
+      parseObject _o = ObjectSchema <$> JSON.parseJSON raw
 
-      -- parseObject o = do
-      --   mbVersion <- o .:? "$schema" -- TODO check this is a valid URI
-      --   i <- o .:? "$id"
-      --   case mbVersion of
-      --     Just ver -> RootSchema (RootMetadata ver i) <$> JSON.parseJSON raw
-      --     Nothing -> SubSchema <$> JSON.parseJSON raw
 
+data RefJSONSchema = RefJSONSchema
+  { rjsURI :: URI
+  , rjsDefinitions :: Definitions
+  , rjsRawObject :: JSON.Object
+  }
+  deriving (Eq, Show)
+
+instance JSON.FromJSON RefJSONSchema where
+  parseJSON = JSON.withObject "RefJSONSchema" $ \o -> do
+    rjsURI <- o .: "$ref"
+    rjsDefinitions <- o .:? "definitions" .!= mempty
+    let rjsRawObject = o
+    pure RefJSONSchema{..}
 
 data ObjectJSONSchema = ObjectJSONSchema
   { ojsDescription :: Maybe Text
@@ -74,6 +80,7 @@ data ObjectJSONSchema = ObjectJSONSchema
   , ojsVersion :: Maybe SchemaVersion
   , ojsValidators :: V.Vector Validator
   , ojsDefinitions :: Definitions
+  , ojsRawObject :: JSON.Object
   }
   deriving (Eq, Show, Generic)
 
@@ -85,6 +92,7 @@ instance JSON.FromJSON ObjectJSONSchema where
     ojsVersion <- o .:? "$schema"
     ojsValidators <- parseAllValidators o
     ojsDefinitions <- o .:? "definitions" .!= mempty
+    let ojsRawObject = o
     pure ObjectJSONSchema{..}
 
 newtype URI = URI { getURI :: U.URI }
@@ -166,22 +174,33 @@ addFragment frag (URI u) =
             else existingFrag
   in URI $ u {U.uriFragment = f <> "/" <> Tx.unpack frag}
 
-schemaId :: JSONSchema -> Maybe SchemaId
-schemaId = \case
+
+objectSchema :: JSONSchema -> Maybe ObjectJSONSchema
+objectSchema = \case
   BoolSchema _ -> Nothing
   RefSchema _ -> Nothing
-  ObjectSchema o -> ojsId o
+  ObjectSchema o -> Just o
 
-definitions :: JSONSchema -> Maybe Definitions
-definitions = \case
-  ObjectSchema o -> Just $ ojsDefinitions o
-  _ -> Nothing
+
+schemaId :: JSONSchema -> Maybe SchemaId
+schemaId = objectSchema >=> ojsId
 
 validators :: JSONSchema -> Maybe (V.Vector Validator)
 validators = \case
   ObjectSchema o -> Just $ ojsValidators o
   _ -> Nothing
 
+definitions :: JSONSchema -> Maybe Definitions
+definitions = \case
+  BoolSchema _ -> Nothing
+  RefSchema s -> Just $ rjsDefinitions s
+  ObjectSchema s -> Just $ ojsDefinitions s
+
+rawObject :: JSONSchema -> Maybe JSON.Object
+rawObject = \case
+  BoolSchema _ -> Nothing
+  RefSchema s -> Just $ rjsRawObject s
+  ObjectSchema s -> Just $ ojsRawObject s
 
 data Validator
   = ValAny AnyValidator

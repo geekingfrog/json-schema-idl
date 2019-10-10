@@ -76,9 +76,10 @@ parseSchema rts = case JSON.parseEither JSON.parseJSON (rtsSchema rts) of
   Right s -> pure (TestSuite (rtsDescription rts) s (rtsTests rts))
 
 
-buildTestSuites :: IO T.TestTree
-buildTestSuites = do
-  tests <- traverse buildTestSuite
+buildOfficialTestSuites :: IO T.TestTree
+buildOfficialTestSuites = do
+  let prefix = "./JSON-Schema-Test-Suite/tests/draft7/"
+  tests <- traverse (buildTestSuite prefix)
     -- [ "additionalItems.json"
     -- , "additionalProperties.json"
     -- , "allOf.json"
@@ -119,10 +120,15 @@ buildTestSuites = do
 
   pure $ T.testGroup "JSON schema official test suite" tests
 
-buildTestSuite :: String -> IO T.TestTree
-buildTestSuite filePath = do
-  suites <- loadTestSuite filePath
-  pure $ T.testGroup filePath $ F.toList (fmap mkTestGroup suites)
+buildCustomTestSuites :: IO T.TestTree
+buildCustomTestSuites = do
+  tests <- buildTestSuite "./test/resources/" "custom.json"
+  pure $ T.testGroup "Custom schema tests" [tests]
+
+buildTestSuite :: FilePath -> FilePath -> IO T.TestTree
+buildTestSuite prefix name = do
+  suites <- loadTestSuite (prefix <> name)
+  pure $ T.testGroup name $ F.toList (fmap mkTestGroup suites)
 
 mkTestGroup :: TestSuite -> T.TestTree
 mkTestGroup ts = T.testGroup (Tx.unpack $ tsDescription ts) $
@@ -138,10 +144,9 @@ mkTestCase schema spec = T.H.testCase (Tx.unpack $ specDescription spec) $
     _ -> pure ()
 
 loadTestSuite :: String -> IO (V.Vector TestSuite)
-loadTestSuite filePath =
-  let fullPath = "./JSON-Schema-Test-Suite/tests/draft7/" <> filePath
-   in JSON.eitherDecodeFileStrict fullPath >>= \case
-        Left err -> T.H.assertFailure $ "Cannot decode test suite: " <> err
-        Right testSuites -> case traverse parseSchema testSuites of
-          Left err -> T.H.assertFailure $ "Cannot decode json schema: " <> err
-          Right x -> pure x
+loadTestSuite fullPath =
+  JSON.eitherDecodeFileStrict fullPath >>= \case
+    Left err -> T.H.assertFailure $ "Cannot decode test suite: " <> err
+    Right testSuites -> case traverse parseSchema testSuites of
+      Left err -> T.H.assertFailure $ "Cannot decode json schema: " <> err
+      Right x -> pure x
