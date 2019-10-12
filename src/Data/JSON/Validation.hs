@@ -18,6 +18,7 @@ import qualified Data.List.Split as Split
 import           Control.Applicative
 import           Control.Monad
 import qualified Control.Monad.Reader  as Rdr
+import qualified Control.Monad.State   as St
 import qualified Data.Aeson            as JSON
 import qualified Data.Aeson.Types      as JSON
 import qualified Data.Aeson.Text       as JSON.Tx
@@ -40,6 +41,7 @@ import qualified Data.Vector           as V
 import           GHC.Generics
 import           Text.Regex.PCRE.Heavy ((=~))
 import qualified Network.URI as U
+import qualified Control.Monad.Except  as Exc
 import qualified Safe
 
 import qualified Data.JSON.Schema      as Sc
@@ -103,8 +105,14 @@ data ValidationError = ValidationError
   }
   deriving (Eq, Show, Generic, JSON.ToJSON)
 
-newtype ValidationM a = ValidationM { runValidationM :: Rdr.Reader ValidationEnv a }
-  deriving newtype (Functor, Applicative, Monad, Rdr.MonadReader ValidationEnv)
+newtype ValidationM a = ValidationM
+  { runValidationM :: Rdr.ReaderT ValidationEnv (St.State ValidationState) a
+  }
+  deriving newtype
+    ( Functor, Applicative, Monad
+    , Rdr.MonadReader ValidationEnv
+    , St.MonadState ValidationState
+    )
 
 type ValM a = ValidationM (ValidationOutcome a)
 
@@ -120,6 +128,10 @@ mkValidationError' keyword msg params = Rdr.ask >>= \env -> pure
     , verrSchemaPath = veSchemaPath env
     }
 
+valMFromEither :: Either [ValidationError] a -> ValM a
+valMFromEither = \case
+  Left e -> pure $ Error e
+  Right a -> pure $ Ok a
 
 data ValidationEnv = ValidationEnv
   { veDataPath :: [Text]
@@ -129,12 +141,14 @@ data ValidationEnv = ValidationEnv
   }
   deriving (Eq, Show)
 
+type ValidationState = Map.HashMap (Sc.URI, [Text]) (Set.HashSet JSON.Value)
+
 addSchemaPath, addDataPath :: Text -> ValidationEnv -> ValidationEnv
 addSchemaPath path env = env {veSchemaPath = path : veSchemaPath env}
 addDataPath path env = env {veDataPath = path : veDataPath env}
 
 runValidation :: ValidationM a -> ValidationEnv -> a
-runValidation m = Rdr.runReader (runValidationM m)
+runValidation m env = St.evalState (Rdr.runReaderT (runValidationM m) env) mempty
 
 validateSchema :: Sc.JSONSchema -> JSON.Value -> ValidationOutcome JSON.Value
 validateSchema schema val =
@@ -147,6 +161,7 @@ validateSchema schema val =
         }
    in runValidation (validate schema val) env
 
+-- TODO take care of infinite loop
 validate :: Sc.JSONSchema -> JSON.Value -> ValM JSON.Value
 validate schema val = case schema of
   Sc.BoolSchema b -> if b
@@ -163,31 +178,53 @@ validateRefSchema rs val = do
   let uri = Sc.rjsURI rs
   let mbRootUri = Sc.schemaId rootSchema
   let refUri = maybe uri ((uri `Sc.relativeTo`) . Sc.getSchemaId) (Sc.schemaId rootSchema)
+
   -- TODO switch schema if base+path isn't the same as root schema
 
-  allReferences <- Rdr.asks veReferences
-  -- case OrdMap.lookup refUri allReferences of
-  --   Nothing -> error "foo"
-  --   Just s -> validate s val
+  traceM $ "refUri: " <> show refUri
+  traceM $ "own uri: " <> show uri
+  traceM $ "root uri: " <> show mbRootUri
 
-  let fragment = U.uriFragment $ Sc.getURI refUri
-  if not (null $ U.uriScheme $ Sc.getURI refUri)
-    then error "doesn't support absolute schema ref yet"
+  seen <- St.get
+  dataPath <- Rdr.asks veDataPath
+  let hasLoop = maybe False (Set.member val) (Map.lookup (refUri, dataPath) seen)
+
+  if hasLoop || isRemoteSchema mbRootUri refUri
+    then
+      if hasLoop
+        then mkValidationError "$ref" "Infinite loop detected" val
+        else error "remote schema"
     else do
-      let byId = note
-            ("No schema found for absolute reference " <> showT refUri)
-            (OrdMap.lookup refUri allReferences)
-      let byFragment = resolveFragment rootSchema fragment
+      let seen' = Map.insertWith Set.union (refUri, dataPath) (Set.singleton val) seen
+      St.put seen'
+      allReferences <- Rdr.asks veReferences
 
-      -- Annoyingly, `Either Text` doesn't have an alternative instance
-      let eitherSchema = either (const byFragment) Right byId
-      case eitherSchema of
-        Left err -> mkValidationError
-          "$ref" ("No schema found for fragment " <> Tx.pack fragment <> " because " <> err) val
-        Right s -> validate s val
+      let fragment = U.uriFragment $ Sc.getURI refUri
+      case OrdMap.lookup refUri allReferences of
+        Just absoluteSchema -> validate absoluteSchema val
+        Nothing -> do -- relative reference or json path
+      -- if not (null $ U.uriScheme $ Sc.getURI refUri)
+      --   then error $ "root schema id: " <> show mbRootUri <> " ref schema uri: " <> show refUri <> " and all refs: " <> show (OrdMap.keys allReferences) -- error "doesn't support absolute schema ref yet"
+      --   else do
+          let byId = note
+                ("No schema found for absolute reference " <> showT refUri)
+                (OrdMap.lookup refUri allReferences)
+          let byFragment = resolveFragment rootSchema fragment
+
+          -- Annoyingly, `Either Text` doesn't have an alternative instance
+          let eitherSchema = either (const byFragment) Right byId
+          case eitherSchema of
+            Left err -> mkValidationError
+              "$ref" ("No schema found for fragment " <> Tx.pack fragment <> " because " <> err) val
+            Right s -> validate s val
 
   where
     withoutFragment (Sc.URI u) = Sc.URI $ u {U.uriFragment = ""}
+    isRemoteSchema mbRootUri (Sc.URI refUri) = case mbRootUri of
+      Nothing -> not $ null (U.uriScheme refUri) && null (maybe "" U.uriRegName $ U.uriAuthority refUri)
+      Just (Sc.SchemaId (Sc.URI rootUri)) -> not $
+        U.uriScheme rootUri == U.uriScheme refUri
+        && U.uriAuthority rootUri == U.uriAuthority refUri
 
 resolveFragment :: Sc.JSONSchema -> String -> Either Text Sc.JSONSchema
 resolveFragment schema fragment =
@@ -476,7 +513,6 @@ validateArray value valA = case value of
       let idxs = V.iterateN (V.length vec) (+1) 0
        in traverse f (V.zip idxs vec)
 
-    -- validateItems :: JSON.Array -> Sc.ItemsValidator -> ValM ()
     validateItems a v = Rdr.local (addSchemaPath "items") $ case Sc.avItems v of
       Sc.SingleSchema schema -> do
         results <- iTraverse

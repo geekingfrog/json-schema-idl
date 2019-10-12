@@ -14,7 +14,7 @@ import qualified Data.Text            as Tx
 import qualified Data.Vector          as V
 import           GHC.Stack            (HasCallStack)
 import qualified Test.Tasty           as T
-import           Test.Tasty.HUnit     ((@=?))
+import           Test.Tasty.HUnit     ((@=?), (@?=))
 import qualified Test.Tasty.HUnit     as T.H
 
 import qualified Data.JSON.Schema     as Sc
@@ -132,7 +132,7 @@ aggregateReferences = T.H.testCase "aggregateReferences" $ do
         , "http://example.com/t/inner.json"
         , "urn:uuid:ee564b8a-7a87-4125-8c96-e9f123d6766f"
         ]
-  Set.fromList (show . Sc.getURI <$> OrdMap.keys refs) @=? expected
+  Set.fromList (show . Sc.getURI <$> OrdMap.keys refs) @?= expected
 
 
 randomTest :: T.TestTree
@@ -174,24 +174,19 @@ parseSchema = JSON.parseEither JSON.parseJSON
 miscTest :: T.TestTree
 miscTest = T.H.testCaseSteps "misc" $ \step -> do
   let json = [JSON.aesonQQ|
-        {
-            "allOf": [{
-                "$ref": "#foo"
-            }],
-            "definitions": {
-                "A": {
-                    "$id": "#foo",
-                    "type": "integer"
-                }
-            }
+        { "$ref": "#"
         }
         |]
 
-  let jsonData = [JSON.aesonQQ|2|]
+  let jsonData = [JSON.aesonQQ|
+          { }
+                |]
+
 
   let (Right schema) = parseSchema json
-  step $ show $ OrdMap.keys $ Sc.aggregateReferences schema
+  step $ "ref keys: " <> show (OrdMap.keys $ Sc.aggregateReferences schema)
   step $ show $ Val.validateSchema schema jsonData
+      -- ref keys: [URI {getURI = http://localhost:1234/node},URI {getURI = http://localhost:1234/tree},URI {getURI = http://localhost:1234/tree#/definitions/node}]
   pure ()
 
 findSchemaTest :: T.TestTree

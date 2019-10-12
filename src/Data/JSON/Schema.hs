@@ -1,3 +1,5 @@
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -95,8 +97,15 @@ instance JSON.FromJSON ObjectJSONSchema where
     let ojsRawObject = o
     pure ObjectJSONSchema{..}
 
+
+deriving instance Hashable U.URI
+deriving instance Generic U.URIAuth
+deriving instance Hashable U.URIAuth
+
 newtype URI = URI { getURI :: U.URI }
-  deriving (Eq, Show, Generic, Ord)
+  deriving stock (Eq, Show, Generic)
+  deriving newtype (Hashable, Ord)
+
 
 instance JSON.FromJSON URI where
   parseJSON = JSON.withText "URI" $ \rawTxt -> do
