@@ -45,6 +45,7 @@ import qualified Control.Monad.Except  as Exc
 import qualified Safe
 
 import qualified Data.JSON.Schema      as Sc
+import qualified Data.JSON.Draft07     as Draft07
 
 -- Data.Validation on hackage requires lens oÔ so let's roll our own simple version
 data ValidationOutcome a
@@ -136,7 +137,7 @@ valMFromEither = \case
 data ValidationEnv = ValidationEnv
   { veDataPath :: [Text]
   , veSchemaPath :: [Text]
-  , veReferences :: OrdMap.Map Sc.URI Sc.JSONSchema
+  , veReferences :: OrdMap.Map Sc.URI (Sc.JSONSchema, Sc.JSONSchema)
   , veRootSchema :: Sc.JSONSchema
   }
   deriving (Eq, Show)
@@ -152,11 +153,14 @@ runValidation m env = St.evalState (Rdr.runReaderT (runValidationM m) env) mempt
 
 validateSchema :: Sc.JSONSchema -> JSON.Value -> ValidationOutcome JSON.Value
 validateSchema schema val =
-  let env = ValidationEnv
+  let localRefs = fmap (schema,) (Sc.aggregateReferences schema)
+      defaultRefs = fmap (Draft07.schema,) (Sc.aggregateReferences Draft07.schema)
+      refs = OrdMap.union localRefs defaultRefs
+      env = ValidationEnv
         { veDataPath = []
         , veSchemaPath = []
         -- only collect references from the root schema
-        , veReferences = Sc.aggregateReferences schema
+        , veReferences = refs
         , veRootSchema = schema
         }
    in runValidation (validate schema val) env
@@ -181,9 +185,9 @@ validateRefSchema rs val = do
 
   -- TODO switch schema if base+path isn't the same as root schema
 
-  traceM $ "refUri: " <> show refUri
-  traceM $ "own uri: " <> show uri
-  traceM $ "root uri: " <> show mbRootUri
+  -- traceM $ "refUri: " <> show refUri
+  -- traceM $ "own uri: " <> show uri
+  -- traceM $ "root uri: " <> show mbRootUri
 
   seen <- St.get
   dataPath <- Rdr.asks veDataPath
@@ -193,7 +197,7 @@ validateRefSchema rs val = do
     then
       if hasLoop
         then mkValidationError "$ref" "Infinite loop detected" val
-        else error "remote schema"
+        else validateRemoteSchema refUri val -- error $ "remote schema: " <> show refUri
     else do
       let seen' = Map.insertWith Set.union (refUri, dataPath) (Set.singleton val) seen
       St.put seen'
@@ -201,14 +205,14 @@ validateRefSchema rs val = do
 
       let fragment = U.uriFragment $ Sc.getURI refUri
       case OrdMap.lookup refUri allReferences of
-        Just absoluteSchema -> validate absoluteSchema val
+        Just (_, absoluteSchema) -> validate absoluteSchema val
         Nothing -> do -- relative reference or json path
       -- if not (null $ U.uriScheme $ Sc.getURI refUri)
       --   then error $ "root schema id: " <> show mbRootUri <> " ref schema uri: " <> show refUri <> " and all refs: " <> show (OrdMap.keys allReferences) -- error "doesn't support absolute schema ref yet"
       --   else do
           let byId = note
                 ("No schema found for absolute reference " <> showT refUri)
-                (OrdMap.lookup refUri allReferences)
+                (snd <$> OrdMap.lookup refUri allReferences)
           let byFragment = resolveFragment rootSchema fragment
 
           -- Annoyingly, `Either Text` doesn't have an alternative instance
@@ -225,6 +229,16 @@ validateRefSchema rs val = do
       Just (Sc.SchemaId (Sc.URI rootUri)) -> not $
         U.uriScheme rootUri == U.uriScheme refUri
         && U.uriAuthority rootUri == U.uriAuthority refUri
+
+    validateRemoteSchema ref val = do
+      refs <- Rdr.asks veReferences
+      case OrdMap.lookup ref refs of
+        Nothing -> mkValidationError
+          "$ref"
+          ("Remote schema not found in environment for ref: " <> showT ref)
+          val
+        Just (newRoot, schema) ->
+          Rdr.local (\e -> e{veRootSchema=newRoot}) $ validate schema val
 
 resolveFragment :: Sc.JSONSchema -> String -> Either Text Sc.JSONSchema
 resolveFragment schema fragment =

@@ -37,6 +37,7 @@ library
   ghc-options:         -fwarn-incomplete-patterns -Werror
   exposed-modules:     Data.JSON.Schema
                      , Data.JSON.Validation
+                     , Data.JSON.Draft07
 
 test-suite test
   type:                exitcode-stdio-1.0

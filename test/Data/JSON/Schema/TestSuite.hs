@@ -88,7 +88,7 @@ buildOfficialTestSuites = do
     , "const.json"
     , "contains.json"
     -- , "default.json" -- not sure what this is, not in the v7 spec as validator for object
-    -- , "definitions.json"
+    , "definitions.json"
     -- , "dependencies.json"
     , "enum.json"
     , "exclusiveMaximum.json"
@@ -116,7 +116,7 @@ buildOfficialTestSuites = do
     , "type.json"
     , "uniqueItems.json"
     ]
-    -- ["definitions.json"]
+    -- ["ref.json"]
 
   pure $ T.testGroup "JSON schema official test suite" tests
 
