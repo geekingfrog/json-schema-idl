@@ -38,17 +38,9 @@ data JSONSchema
   = BoolSchema Bool
   | RefSchema RefJSONSchema
   | ObjectSchema ObjectJSONSchema
-
-  -- JSONSchema
-  -- { jsVersion :: Maybe SchemaVersion
-  -- , jsId :: Maybe SchemaId
-  -- , jsComment :: Maybe Text
-  -- , jsSchema :: Schema
-  -- }
-  -- = RootSchema RootMetadata Schema
-  -- | SubSchema Schema
   deriving (Eq, Show)
 
+-- TODO validate the schema against its metaschema when deserializing ?
 instance JSON.FromJSON JSONSchema where
   parseJSON raw
     = JSON.withBool "boolean JSONSchema" parseBool raw
@@ -63,6 +55,7 @@ instance JSON.FromJSON JSONSchema where
 
 data RefJSONSchema = RefJSONSchema
   { rjsURI :: URI
+  , rjsId :: Maybe SchemaId
   , rjsDefinitions :: Definitions
   , rjsRawObject :: JSON.Object
   }
@@ -71,6 +64,7 @@ data RefJSONSchema = RefJSONSchema
 instance JSON.FromJSON RefJSONSchema where
   parseJSON = JSON.withObject "RefJSONSchema" $ \o -> do
     rjsURI <- o .: "$ref"
+    rjsId <- o .:? "$id"
     rjsDefinitions <- o .:? "definitions" .!= mempty
     let rjsRawObject = o
     pure RefJSONSchema{..}
@@ -192,7 +186,10 @@ objectSchema = \case
 
 
 schemaId :: JSONSchema -> Maybe SchemaId
-schemaId = objectSchema >=> ojsId
+schemaId = \case
+  BoolSchema _ -> Nothing
+  RefSchema r -> rjsId r
+  ObjectSchema o -> ojsId o
 
 validators :: JSONSchema -> Maybe (V.Vector Validator)
 validators = \case
@@ -218,6 +215,7 @@ data Validator
   | ValNumeric NumericValidator
   | ValString StringValidator
   | ValLogic LogicValidator
+  | ValConditional ConditionalValidator
   deriving (Eq, Show)
 
 -- to avoid importing some heavy prisms
@@ -240,6 +238,7 @@ parseAllValidators o = do
     , fmap ValNumeric <$> parseNumericValidator o
     , fmap ValString <$> parseStringValidator o
     , fmap ValLogic <$> parseLogicValidator o
+    , fmap ValConditional <$> parseConditionalValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
@@ -514,3 +513,23 @@ parseLogicValidator o = do
           if V.null vec
             then fail $ Tx.unpack key <> " is empty"
             else pure vec
+
+data ConditionalValidator = ConditionalValidator
+  { cvIf :: JSONSchema
+  , cvThen :: Maybe JSONSchema
+  , cvElse :: Maybe JSONSchema
+  }
+  deriving (Eq, Show)
+
+parseConditionalValidator :: JSON.Object -> JSON.Parser (Maybe ConditionalValidator)
+parseConditionalValidator o = do
+  mbCvIf <- o .:? "if"
+  cvThen <- o .:? "then"
+  cvElse <- o .:? "else"
+
+  case mbCvIf of
+    Nothing -> pure Nothing
+    -- an `if` alone has no impact on the overall validation
+    Just cvIf -> if Mb.isNothing cvThen && Mb.isNothing cvElse
+      then pure Nothing
+      else pure $ Just ConditionalValidator{..}

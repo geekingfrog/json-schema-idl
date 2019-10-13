@@ -6,7 +6,7 @@
         "foo": { "type": "integer" }
       },
       "properties": {
-        "prop": { "$ref": "#/foo" }
+        "prop": { "$ref": "#/definitions/foo" }
       }
     },
     "tests": [

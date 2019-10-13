@@ -1,3 +1,4 @@
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE DeriveAnyClass             #-}
 {-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE DeriveGeneric              #-}
@@ -46,6 +47,30 @@ import qualified Safe
 
 import qualified Data.JSON.Schema      as Sc
 import qualified Data.JSON.Draft07     as Draft07
+
+
+
+loadSchema :: Sc.JSONSchema -> ValidationEnv
+loadSchema schema = ValidationEnv
+  { veDataPath = []
+  , veSchemaPath = []
+  , veReferences = (schema,) <$> Sc.aggregateReferences schema
+  , veRootSchema = schema
+  }
+
+addSchema :: ValidationEnv -> Sc.JSONSchema -> Either Text ValidationEnv
+addSchema env@ValidationEnv{veReferences} schema =
+  case Sc.schemaId schema of
+    Nothing -> Left "Added schema must have an $id property"
+    Just s -> pure $ env
+      { veReferences = OrdMap.union veReferences newRefs
+      }
+
+  where
+    newRefs = (schema,) <$> Sc.aggregateReferences schema
+
+validateSchema :: ValidationEnv -> JSON.Value -> ValidationOutcome JSON.Value
+validateSchema env val = runValidation (validate (veRootSchema env) val) env
 
 -- Data.Validation on hackage requires lens oÔ so let's roll our own simple version
 data ValidationOutcome a
@@ -96,6 +121,11 @@ prettyValidationOutcome = \case
       , "schemaPath: \"#/" <> Tx.intercalate "/" (reverse $ verrSchemaPath err) <> "\""
       , "params: " <> LTx.toStrict (JSON.Tx.encodeToLazyText $ verrParams err)
       ]
+
+toEither :: ValidationOutcome a -> Either [ValidationError] a
+toEither = \case
+  Ok x -> Right x
+  Error errs -> Left errs
 
 data ValidationError = ValidationError
   { verrKeyword :: Text
@@ -151,21 +181,6 @@ addDataPath path env = env {veDataPath = path : veDataPath env}
 runValidation :: ValidationM a -> ValidationEnv -> a
 runValidation m env = St.evalState (Rdr.runReaderT (runValidationM m) env) mempty
 
-validateSchema :: Sc.JSONSchema -> JSON.Value -> ValidationOutcome JSON.Value
-validateSchema schema val =
-  let localRefs = fmap (schema,) (Sc.aggregateReferences schema)
-      defaultRefs = fmap (Draft07.schema,) (Sc.aggregateReferences Draft07.schema)
-      refs = OrdMap.union localRefs defaultRefs
-      env = ValidationEnv
-        { veDataPath = []
-        , veSchemaPath = []
-        -- only collect references from the root schema
-        , veReferences = refs
-        , veRootSchema = schema
-        }
-   in runValidation (validate schema val) env
-
--- TODO take care of infinite loop
 validate :: Sc.JSONSchema -> JSON.Value -> ValM JSON.Value
 validate schema val = case schema of
   Sc.BoolSchema b -> if b
@@ -185,10 +200,6 @@ validateRefSchema rs val = do
 
   -- TODO switch schema if base+path isn't the same as root schema
 
-  -- traceM $ "refUri: " <> show refUri
-  -- traceM $ "own uri: " <> show uri
-  -- traceM $ "root uri: " <> show mbRootUri
-
   seen <- St.get
   dataPath <- Rdr.asks veDataPath
   let hasLoop = maybe False (Set.member val) (Map.lookup (refUri, dataPath) seen)
@@ -204,12 +215,12 @@ validateRefSchema rs val = do
       allReferences <- Rdr.asks veReferences
 
       let fragment = U.uriFragment $ Sc.getURI refUri
+
+      traceM $ "fragment: " <> show fragment
+
       case OrdMap.lookup refUri allReferences of
         Just (_, absoluteSchema) -> validate absoluteSchema val
         Nothing -> do -- relative reference or json path
-      -- if not (null $ U.uriScheme $ Sc.getURI refUri)
-      --   then error $ "root schema id: " <> show mbRootUri <> " ref schema uri: " <> show refUri <> " and all refs: " <> show (OrdMap.keys allReferences) -- error "doesn't support absolute schema ref yet"
-      --   else do
           let byId = note
                 ("No schema found for absolute reference " <> showT refUri)
                 (snd <$> OrdMap.lookup refUri allReferences)
@@ -276,7 +287,7 @@ resolveFragment schema fragment =
       else do
         os <- note "No json object found" $ Sc.rawObject schema
         note
-          ("No schema found for json pointer" <> Tx.pack fragment)
+          ("No schema found for json pointer " <> Tx.pack fragment)
           (findSchema (JSON.Object os) (Tx.pack fragment))
 
   where
@@ -289,16 +300,6 @@ resolveFragment schema fragment =
     chunkFrag str =
       let (h, t) = span (/= '/') (sanitize str)
        in (unEscape $ Tx.pack h, t)
-
-
-findSchemaByAbsoluteRef
-  :: OrdMap.Map Sc.URI Sc.JSONSchema
-  -> Sc.URI
-  -> Maybe Sc.JSONSchema
-
-findSchemaByAbsoluteRef =
-  let
-  in error "foo"
 
 
 unEscape :: Text -> Text
@@ -340,6 +341,7 @@ validateObjectSchema value = \case
   Sc.ValNumeric valN -> validateNumeric value valN
   Sc.ValString valStr -> validateString value valStr
   Sc.ValLogic valLogic -> validateLogic value valLogic
+  Sc.ValConditional valCond -> validateConditional value valCond
 
 runMbValidator :: (a -> ValM ()) -> Maybe a -> ValM ()
 runMbValidator = maybe (pure $ pure ())
@@ -717,6 +719,15 @@ validateLogic value valLogic = F.sequenceA_ <$> sequence
 mkJSONNum :: Int -> JSON.Value
 mkJSONNum x = JSON.Number $ Scientific.scientific (fromIntegral x) 0
 
+
+validateConditional :: JSON.Value -> Sc.ConditionalValidator -> ValM ()
+validateConditional val valCond = validate (Sc.cvIf valCond) val >>= \case
+  Ok _ -> case Sc.cvThen valCond of
+    Nothing -> pure (Ok ())
+    Just valThen -> fmap void (validate valThen val)
+  Error _ -> case Sc.cvElse valCond of
+    Nothing -> pure (Ok ())
+    Just valElse -> fmap void (validate valElse val)
 
 
 hush :: Either e a -> Maybe a

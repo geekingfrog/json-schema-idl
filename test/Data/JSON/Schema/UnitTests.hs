@@ -157,7 +157,7 @@ randomTest = T.H.testCaseSteps "boom" $ \step -> do
       T.H.assertFailure "schema failed to parse"
     Right schema -> do
       step $ "parsed schema: " <> show schema
-      let result = Val.validateSchema schema val
+      let result = Val.validateSchema (Val.loadSchema schema) val
       step $ Tx.unpack $ "result of validation: " <> Val.prettyValidationOutcome result
       case result of
         Val.Error e -> step $ "number of errors: " <> show (length e)
@@ -174,18 +174,24 @@ parseSchema = JSON.parseEither JSON.parseJSON
 miscTest :: T.TestTree
 miscTest = T.H.testCaseSteps "misc" $ \step -> do
   let json = [JSON.aesonQQ|
-        { "$ref": "#"
+        {
+          "definitions": {
+            "foo": { "type": "integer" }
+          },
+          "properties": {
+            "prop": { "$ref": "#/foo" }
+          }
         }
         |]
 
   let jsonData = [JSON.aesonQQ|
-          { }
+          {"prop": "foo" }
                 |]
 
 
   let (Right schema) = parseSchema json
   step $ "ref keys: " <> show (OrdMap.keys $ Sc.aggregateReferences schema)
-  step $ show $ Val.validateSchema schema jsonData
+  step $ show $ Val.validateSchema (Val.loadSchema schema) jsonData
       -- ref keys: [URI {getURI = http://localhost:1234/node},URI {getURI = http://localhost:1234/tree},URI {getURI = http://localhost:1234/tree#/definitions/node}]
   pure ()
 

@@ -19,6 +19,7 @@ import qualified Test.Tasty.HUnit     as T.H
 
 import qualified Data.JSON.Schema     as Sc
 import qualified Data.JSON.Validation as Val
+import qualified Data.JSON.Draft07    as Draft07
 
 data RawTestSuite = RawTestSuite
   { rtsDescription :: Text
@@ -93,7 +94,7 @@ buildOfficialTestSuites = do
     , "enum.json"
     , "exclusiveMaximum.json"
     , "exclusiveMinimum.json"
-    -- , "if-then-else.json"
+    , "if-then-else.json"
     , "items.json" -- requires definitions, references to def and additionalItems to fully pass
     , "maximum.json"
     , "maxItems.json"
@@ -116,7 +117,7 @@ buildOfficialTestSuites = do
     , "type.json"
     , "uniqueItems.json"
     ]
-    -- ["ref.json"]
+    -- ["if-then-else.json"]
 
   pure $ T.testGroup "JSON schema official test suite" tests
 
@@ -135,8 +136,12 @@ mkTestGroup ts = T.testGroup (Tx.unpack $ tsDescription ts) $
   F.toList (fmap (mkTestCase (tsSchema ts)) (tsTests ts))
 
 mkTestCase :: Sc.JSONSchema -> TestSpec -> T.TestTree
-mkTestCase schema spec = T.H.testCase (Tx.unpack $ specDescription spec) $
-  case (specValid spec, Val.validateSchema schema (specData spec)) of
+mkTestCase schema spec = T.H.testCase (Tx.unpack $ specDescription spec) $ do
+  let env = case Val.addSchema (Val.loadSchema schema) Draft07.schema of
+        Left err -> error (Tx.unpack err)
+        Right x -> x
+
+  case (specValid spec, Val.validateSchema env (specData spec)) of
     (True, Val.Error errs) ->
       T.H.assertFailure $ "Expected to be valid but failed with: " <> show errs <> " - for value: " <> show (specData spec) <> " - and schema: " <> show schema
     (False, Val.Ok _) ->
