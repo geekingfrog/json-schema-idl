@@ -216,6 +216,7 @@ data Validator
   | ValString StringValidator
   | ValLogic LogicValidator
   | ValConditional ConditionalValidator
+  | ValDependencies DependenciesValidator
   deriving (Eq, Show)
 
 -- to avoid importing some heavy prisms
@@ -239,6 +240,7 @@ parseAllValidators o = do
     , fmap ValString <$> parseStringValidator o
     , fmap ValLogic <$> parseLogicValidator o
     , fmap ValConditional <$> parseConditionalValidator o
+    , fmap ValDependencies <$> parseDependenciesValidator o
     ]
   pure $ V.fromList $ Mb.catMaybes vals
 
@@ -533,3 +535,24 @@ parseConditionalValidator o = do
     Just cvIf -> if Mb.isNothing cvThen && Mb.isNothing cvElse
       then pure Nothing
       else pure $ Just ConditionalValidator{..}
+
+
+newtype DependenciesValidator = DependenciesValidator (Map.HashMap Text DependencyValidator)
+  deriving (Eq, Show)
+
+data DependencyValidator
+  = RequiredDependencies (V.Vector Text)
+  | SchemaDependency JSONSchema
+  deriving (Eq, Show)
+
+parseDependenciesValidator :: JSON.Object -> JSON.Parser (Maybe DependenciesValidator)
+parseDependenciesValidator o = do
+  deps <- o .:? "dependencies" .!= mempty
+  if null deps
+    then pure Nothing
+    else pure $ Just $ DependenciesValidator deps
+
+instance JSON.FromJSON DependencyValidator where
+  parseJSON raw
+    = (RequiredDependencies <$> JSON.parseJSON raw)
+    <|> (SchemaDependency <$> JSON.parseJSON raw)

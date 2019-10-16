@@ -139,13 +139,13 @@ randomTest :: T.TestTree
 randomTest = T.H.testCaseSteps "boom" $ \step -> do
   let rawSchema = [JSON.aesonQQ|
         {
-            "tilda~field": {"type": "integer"},
-            "slash/field": {"type": "integer"},
-            "percent%field": {"type": "integer"},
-            "properties": {
-                "tilda": {"$ref": "#/tilda~0field"},
-                "slash": {"$ref": "#/slash~1field"},
-                "percent": {"$ref": "#/percent%25field"}
+            "dependencies": {
+                "bar": {
+                    "properties": {
+                        "foo": {"type": "integer"},
+                        "bar": {"type": "integer"}
+                    }
+                }
             }
         }
         |]
@@ -156,7 +156,9 @@ randomTest = T.H.testCaseSteps "boom" $ \step -> do
       step err
       T.H.assertFailure "schema failed to parse"
     Right schema -> do
-      step $ "parsed schema: " <> show schema
+      -- step $ "parsed schema: " <> show schema
+      let (Just validators) = Sc.validators schema
+      step $ "dep val: " <> show [v | Sc.ValDependencies v <- V.toList validators]
       let result = Val.validateSchema (Val.loadSchema schema) val
       step $ Tx.unpack $ "result of validation: " <> Val.prettyValidationOutcome result
       case result of
@@ -175,24 +177,22 @@ miscTest :: T.TestTree
 miscTest = T.H.testCaseSteps "misc" $ \step -> do
   let json = [JSON.aesonQQ|
         {
-          "definitions": {
-            "foo": { "type": "integer" }
-          },
-          "properties": {
-            "prop": { "$ref": "#/foo" }
-          }
+            "$id": "http://localhost:1234/",
+            "items": {
+                "$id": "folder/",
+                "items": {"$ref": "folderInteger.json"}
+            }
         }
         |]
 
   let jsonData = [JSON.aesonQQ|
-          {"prop": "foo" }
+          [["foo"]]
                 |]
 
 
   let (Right schema) = parseSchema json
-  step $ "ref keys: " <> show (OrdMap.keys $ Sc.aggregateReferences schema)
+  -- step $ "ref keys: " <> show (Sc.aggregateReferences schema)
   step $ show $ Val.validateSchema (Val.loadSchema schema) jsonData
-      -- ref keys: [URI {getURI = http://localhost:1234/node},URI {getURI = http://localhost:1234/tree},URI {getURI = http://localhost:1234/tree#/definitions/node}]
   pure ()
 
 findSchemaTest :: T.TestTree

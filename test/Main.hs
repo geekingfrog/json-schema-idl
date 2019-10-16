@@ -15,5 +15,5 @@ main = do
         -- , customTestSuite
         -- , Unit.tests
         -- ]
-        [testSuite]
+        [Unit.tests]
   T.defaultMain fullTests

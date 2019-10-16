@@ -81,6 +81,7 @@ data ValidationOutcome a
 instance Applicative ValidationOutcome where
   pure = Ok
   f <*> x = case (f, x) of
+    (Error err1, Error err2) -> Error (err1 <> err2)
     (Error err, _) -> Error err
     (_, Error err) -> Error err
     (Ok fun, Ok val) -> Ok (fun val)
@@ -342,6 +343,7 @@ validateObjectSchema value = \case
   Sc.ValString valStr -> validateString value valStr
   Sc.ValLogic valLogic -> validateLogic value valLogic
   Sc.ValConditional valCond -> validateConditional value valCond
+  Sc.ValDependencies valDeps -> validateDependencies value valDeps
 
 runMbValidator :: (a -> ValM ()) -> Maybe a -> ValM ()
 runMbValidator = maybe (pure $ pure ())
@@ -728,6 +730,29 @@ validateConditional val valCond = validate (Sc.cvIf valCond) val >>= \case
   Error _ -> case Sc.cvElse valCond of
     Nothing -> pure (Ok ())
     Just valElse -> fmap void (validate valElse val)
+
+
+validateDependencies :: JSON.Value -> Sc.DependenciesValidator -> ValM ()
+validateDependencies val (Sc.DependenciesValidator valDeps) = Rdr.local (addSchemaPath "dependencies") $
+  case val of
+    JSON.Object o ->
+      F.sequenceA_ <$> traverse (validateDependency o) (Map.toList valDeps)
+
+    _ -> pure $ Ok ()
+
+  where
+    validateDependency :: JSON.Object -> (Text, Sc.DependencyValidator) -> ValM ()
+    validateDependency o (requiredKey, validator) = case Map.lookup requiredKey o of
+      Nothing -> pure $ Ok ()
+      Just _val -> case validator of
+        Sc.RequiredDependencies requiredKeys ->
+          F.sequenceA_ <$> traverse (assertKeyPresent o) requiredKeys
+        Sc.SchemaDependency schema ->
+          void <$> validate schema (JSON.Object o)
+
+    assertKeyPresent obj key = if Map.member key obj
+      then pure $ Ok ()
+      else mkValidationError "dependencies" ("Required key missing: " <> key) (JSON.Object obj)
 
 
 hush :: Either e a -> Maybe a
